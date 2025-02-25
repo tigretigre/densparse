@@ -14,57 +14,82 @@ class DenSparseMatrix(nn.Module):
         self.mapping = mapping
         self.max_batch = max_batch
 
-        # Initialize the forward and reverse weight matrices
-        self.forward_weights = nn.Parameter(
-            torch.zeros(mapping.input_size, mapping.mapping_width))
-        self.reverse_weights = nn.Parameter(
-            torch.zeros(mapping.output_size, mapping.mapping_width))
+        # Initialize the forward and reverse weight matrices as parameters
+        self.register_parameter(
+            '_forward_weights_param',
+            nn.Parameter(torch.zeros(mapping.input_size, mapping.mapping_width))
+        )
+        self.register_parameter(
+            '_reverse_weights_param',
+            nn.Parameter(torch.zeros(mapping.output_size, mapping.mapping_width))
+        )
 
-        # Create working area tensor (max_size × mapping_width × max_batch)
+        # Create working area tensor as a buffer
         max_size = max(mapping.input_size, mapping.output_size)
-        self._working = torch.zeros(max_size, mapping.mapping_width, max_batch)
+        self.register_buffer(
+            '_working',
+            torch.zeros(max_size, mapping.mapping_width, max_batch)
+        )
 
     @property
-    def forward_mapping(self):
-        return self.mapping.input_mapping
-
-    @property
-    def forward_mask(self):
-        return self.mapping.input_mask
-
-    @property
-    def reverse_mapping(self):
-        return self.mapping.output_mapping
-
-    @property
-    def reverse_mask(self):
-        return self.mapping.output_mask
-
-    @property
-    def input_size(self):
+    def input_size(self) -> int:
         """Size of input dimension."""
         return self.mapping.input_size
 
     @property
-    def output_size(self):
+    def output_size(self) -> int:
         """Size of output dimension."""
         return self.mapping.output_size
+
+    @property
+    def forward_mask(self) -> torch.Tensor:
+        """Input-side mask matrix."""
+        return self.mapping.input_mask
+
+    @property
+    def reverse_mask(self) -> torch.Tensor:
+        """Output-side mask matrix."""
+        return self.mapping.output_mask
+
+    @property
+    def forward_mapping(self) -> torch.Tensor:
+        """Input-side mapping matrix."""
+        return self.mapping.input_mapping
+
+    @property
+    def reverse_mapping(self) -> torch.Tensor:
+        """Output-side mapping matrix."""
+        return self.mapping.output_mapping
+
+    @property
+    def forward_weights(self) -> torch.Tensor:
+        """Input-side weight matrix."""
+        return self._parameters['_forward_weights_param']
+
+    @property
+    def reverse_weights(self) -> torch.Tensor:
+        """Output-side weight matrix."""
+        return self._parameters['_reverse_weights_param']
 
     def _update_reverse_weights(self):
         """Update reverse weights to match forward weights using the mappings."""
         with torch.no_grad():
             # Zero out working area (using just the first batch slice)
-            self._working[self.mapping.input_size:, :, 0].zero_()
+            self._buffers['_working'][self.mapping.input_size:, :, 0].zero_()
             
             # Copy forward weights into working area
-            self._working[:self.mapping.input_size, :, 0] = self.forward_weights
+            self._buffers['_working'][:self.mapping.input_size, :, 0] = self._parameters['_forward_weights_param']
             
             # Rearrange each column according to mapping
             for k in range(self.mapping.mapping_width):
-                self._working[:self.mapping.output_size, k, 0] = self._working[self.mapping.output_mapping[:, k], k, 0]
+                self._buffers['_working'][:self.mapping.output_size, k, 0] = (
+                    self._buffers['_working'][self.mapping.output_mapping[:, k], k, 0]
+                )
             
-            # Copy relevant portion to reverse weights
-            self.reverse_weights.copy_(self._working[:self.mapping.output_size, :, 0])
+            # Copy to reverse weights
+            self._parameters['_reverse_weights_param'].copy_(
+                self._buffers['_working'][:self.mapping.output_size, :, 0]
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with automatic handling of vector vs matrix input.
@@ -90,6 +115,14 @@ class DenSparseMatrix(nn.Module):
             Output tensor of shape (batch_size, output_size) for batches
             or (output_size,) for single inputs
         """
+        # Debug prints
+        print(f"\nTensor devices in _multiply_matrix:")
+        print(f"x device: {x.device}")
+        print(f"forward_weights device: {self._parameters['_forward_weights_param'].device}")
+        print(f"forward_mask device: {self.mapping.input_mask.device}")
+        print(f"forward_mapping device: {self.mapping.input_mapping.device}")
+        print(f"_working device: {self._buffers['_working'].device}")
+        
         # Handle vector vs batch input
         was_vector = x.dim() == 1
         if was_vector:
@@ -101,26 +134,26 @@ class DenSparseMatrix(nn.Module):
             raise ValueError(f"Batch size {batch_size} exceeds maximum {self.max_batch}")
 
         # Zero out working area
-        self._working[..., :batch_size].zero_()
+        self._buffers['_working'][..., :batch_size].zero_()
         
         # Do multiplication with transposed input
-        self._working[:self.mapping.input_size, :, :batch_size] = (
-            self.forward_weights.unsqueeze(2) * 
-            self.forward_mask.unsqueeze(2) * 
+        self._buffers['_working'][:self.mapping.input_size, :, :batch_size] = (
+            self._parameters['_forward_weights_param'].unsqueeze(2) * 
+            self.mapping.input_mask.unsqueeze(2) * 
             x.t().unsqueeze(1)
         )
 
         # Rearrange each column according to mapping
         for k in range(self.mapping.mapping_width):
-            self._working[:self.output_size, k, :batch_size] = (
-                self._working[self.mapping.output_mapping[:, k], k, :batch_size]
+            self._buffers['_working'][:self.mapping.output_size, k, :batch_size] = (
+                self._buffers['_working'][self.mapping.output_mapping[:, k], k, :batch_size]
             )
 
         # Apply output mask before summing
-        self._working[:self.output_size, :, :batch_size] *= self.reverse_mask.unsqueeze(2)
+        self._buffers['_working'][:self.mapping.output_size, :, :batch_size] *= self.mapping.output_mask.unsqueeze(2)
         
-        # Sum and transpose back to (batch_size, output_size)
-        result = self._working[:self.mapping.output_size, :, :batch_size].sum(dim=1).t()
+        # Sum and transpose back
+        result = self._buffers['_working'][:self.mapping.output_size, :, :batch_size].sum(dim=1).t()
         
         # Return vector for single inputs
         return result.squeeze(0) if was_vector else result
@@ -132,12 +165,27 @@ class DenSparseMatrix(nn.Module):
         """Returns a transposed view of this matrix."""
         # Create new matrix with transposed mapping
         transposed = DenSparseMatrix(self.mapping.transpose(), max_batch=self.max_batch)
-
+        
         # Swap weights
-        transposed.forward_weights = self.reverse_weights
-        transposed.reverse_weights = self.forward_weights
-
+        transposed._parameters['_forward_weights_param'] = self._parameters['_reverse_weights_param']
+        transposed._parameters['_reverse_weights_param'] = self._parameters['_forward_weights_param']
+        
         return transposed
+
+    def to(self, device: torch.device) -> 'DenSparseMatrix':
+        """Move matrix to specified device."""
+        # Move parameters and buffers
+        self._parameters['_forward_weights_param'] = nn.Parameter(self._parameters['_forward_weights_param'].to(device))
+        self._parameters['_reverse_weights_param'] = nn.Parameter(self._parameters['_reverse_weights_param'].to(device))
+        self._buffers['_working'] = self._buffers['_working'].to(device)
+        
+        # Move mapping tensors
+        self.mapping.input_mapping = self.mapping.input_mapping.to(device)
+        self.mapping.input_mask = self.mapping.input_mask.to(device)
+        self.mapping.output_mapping = self.mapping.output_mapping.to(device)
+        self.mapping.output_mask = self.mapping.output_mask.to(device)
+        
+        return self
 
     def set_weight(self, input_idx: int, output_idx: int, weight: float, ignore_unmapped: bool = False) -> None:
         """Set weight for connection between input_idx and output_idx.
@@ -154,12 +202,12 @@ class DenSparseMatrix(nn.Module):
         """
         # Find matching columns in forward and reverse mappings
         forward_cols = torch.where(
-            self.forward_mask[input_idx] & 
-            (self.forward_mapping[input_idx] == output_idx)
+            self.mapping.input_mask[input_idx] & 
+            (self.mapping.input_mapping[input_idx] == output_idx)
         )[0]
         reverse_cols = torch.where(
-            self.reverse_mask[output_idx] & 
-            (self.reverse_mapping[output_idx] == input_idx)
+            self.mapping.output_mask[output_idx] & 
+            (self.mapping.output_mapping[output_idx] == input_idx)
         )[0]
         
         if not forward_cols.numel():
@@ -172,18 +220,18 @@ class DenSparseMatrix(nn.Module):
         assert forward_cols.numel() == 1 and reverse_cols.numel() == 1, \
             f"""
             Found multiple connections between input {input_idx} and output {output_idx}
-            input_mapping: {self.forward_mapping[input_idx]}
-            output_mapping: {self.reverse_mapping[output_idx]}
-            forward_mask: {self.forward_mask[input_idx]}
-            reverse_mask: {self.reverse_mask[output_idx]}
+            input_mapping: {self.mapping.input_mapping[input_idx]}
+            output_mapping: {self.mapping.output_mapping[output_idx]}
+            forward_mask: {self.mapping.input_mask[input_idx]}
+            reverse_mask: {self.mapping.output_mask[output_idx]}
             forward_cols: {forward_cols}
             reverse_cols: {reverse_cols}
             """
         
         with torch.no_grad():
             col = forward_cols[0].item()
-            self.forward_weights[input_idx, col] = weight
-            self.reverse_weights[output_idx, col] = weight
+            self._parameters['_forward_weights_param'][input_idx, col] = weight
+            self._parameters['_reverse_weights_param'][output_idx, col] = weight
 
     def to_dense(self, use_grad: bool = False) -> torch.Tensor:
         """Convert to a dense matrix representation.
@@ -194,14 +242,14 @@ class DenSparseMatrix(nn.Module):
         Returns:
             A (output_size, input_size) tensor containing the dense matrix
         """
-        dense = torch.zeros(self.output_size, self.input_size)
-        matrix = self.forward_weights.grad if use_grad else self.forward_weights
+        dense = torch.zeros(self.mapping.output_size, self.mapping.input_size)
+        matrix = self._parameters['_forward_weights_param'].grad if use_grad else self._parameters['_forward_weights_param']
         
         # For each input, find all its unmasked connections and assign values
-        for i in range(self.input_size):
-            cols = torch.where(self.forward_mask[i])[0]
+        for i in range(self.mapping.input_size):
+            cols = torch.where(self.mapping.input_mask[i])[0]
             if cols.numel():
-                j = self.forward_mapping[i, cols]
+                j = self.mapping.input_mapping[i, cols]
                 dense[j, i] = matrix[i, cols]
         
         return dense
@@ -213,7 +261,7 @@ class DenSparseMatrix(nn.Module):
     def randomize_weights(self):
         """Initialize weights with random values from N(0,1)."""
         with torch.no_grad():
-            self.forward_weights.normal_()
+            self._parameters['_forward_weights_param'].normal_()
             self._update_reverse_weights()
 
     def get_weight(self, input_idx: int, output_idx: int) -> float:
@@ -228,14 +276,14 @@ class DenSparseMatrix(nn.Module):
         """
         # Find matching column in forward mapping
         cols = torch.where(
-            self.forward_mask[input_idx] & 
-            (self.forward_mapping[input_idx] == output_idx)
+            self.mapping.input_mask[input_idx] & 
+            (self.mapping.input_mapping[input_idx] == output_idx)
         )[0]
         
         if not cols.numel():
             return 0.0
         
-        return self.forward_weights[input_idx, cols[0]].item()
+        return self._parameters['_forward_weights_param'][input_idx, cols[0]].item()
 
     @classmethod
     def from_dense(cls, dense: torch.Tensor, max_batch: int = 32) -> 'DenSparseMatrix':
@@ -257,13 +305,25 @@ class DenSparseMatrix(nn.Module):
         
         with torch.no_grad():
             # For each input, find all its unmasked connections
-            for i in range(matrix.input_size):
-                cols = torch.where(matrix.forward_mask[i])[0]
+            for i in range(matrix.mapping.input_size):
+                cols = torch.where(matrix.mapping.input_mask[i])[0]
                 if cols.numel():
-                    j = matrix.forward_mapping[i, cols]
-                    matrix.forward_weights[i, cols] = dense[j, i]
+                    j = matrix.mapping.input_mapping[i, cols]
+                    matrix._parameters['_forward_weights_param'][i, cols] = dense[j, i]
             
             matrix._update_reverse_weights()
         
         return matrix
+
+    def cpu(self) -> 'DenSparseMatrix':
+        """Move matrix to CPU."""
+        return self.to(torch.device('cpu'))
+
+    def cuda(self) -> 'DenSparseMatrix':
+        """Move matrix to CUDA device."""
+        return self.to(torch.device('cuda'))
+
+    def mps(self) -> 'DenSparseMatrix':
+        """Move matrix to MPS device."""
+        return self.to(torch.device('mps'))
 

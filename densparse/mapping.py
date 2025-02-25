@@ -164,14 +164,46 @@ class DenSparseMapping:
         assert output_mapping.shape == output_mask.shape
         assert input_mapping.shape[1] == output_mapping.shape[1]
 
-        self.input_mapping = input_mapping
-        self.input_mask = input_mask
-        self.output_mapping = output_mapping
-        self.output_mask = output_mask
+        self._input_mapping = input_mapping
+        self._input_mask = input_mask
+        self._output_mapping = output_mapping
+        self._output_mask = output_mask
 
         self.input_size = input_mapping.size(0)
         self.output_size = output_mapping.size(0)
         self.mapping_width = input_mapping.size(1)
+
+    @property
+    def input_mapping(self):
+        return self._input_mapping
+    
+    @input_mapping.setter
+    def input_mapping(self, value):
+        self._input_mapping = value
+
+    @property
+    def input_mask(self):
+        return self._input_mask
+    
+    @input_mask.setter
+    def input_mask(self, value):
+        self._input_mask = value
+
+    @property
+    def output_mapping(self):
+        return self._output_mapping
+    
+    @output_mapping.setter
+    def output_mapping(self, value):
+        self._output_mapping = value
+
+    @property
+    def output_mask(self):
+        return self._output_mask
+    
+    @output_mask.setter
+    def output_mask(self, value):
+        self._output_mask = value
 
     @classmethod
     def from_function(
