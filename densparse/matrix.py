@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Callable, Tuple
 from densparse.mapping import DenSparseMapping
+import time
 
 class DenSparseMatrix(nn.Module):
     def __init__(self, mapping: DenSparseMapping, max_batch: int = 32):
@@ -115,26 +116,20 @@ class DenSparseMatrix(nn.Module):
             Output tensor of shape (batch_size, output_size) for batches
             or (output_size,) for single inputs
         """
-        # Debug prints
-        print(f"\nTensor devices in _multiply_matrix:")
-        print(f"x device: {x.device}")
-        print(f"forward_weights device: {self._parameters['_forward_weights_param'].device}")
-        print(f"forward_mask device: {self.mapping.input_mask.device}")
-        print(f"forward_mapping device: {self.mapping.input_mapping.device}")
-        print(f"_working device: {self._buffers['_working'].device}")
-        
+        t0 = time.perf_counter()
         # Handle vector vs batch input
         was_vector = x.dim() == 1
         if was_vector:
-            # Single input: (input_size,) -> (1, input_size)
             x = x.unsqueeze(0)
         
         batch_size = x.shape[0]
         if batch_size > self.max_batch:
             raise ValueError(f"Batch size {batch_size} exceeds maximum {self.max_batch}")
+        t1 = time.perf_counter()
 
         # Zero out working area
         self._buffers['_working'][..., :batch_size].zero_()
+        t2 = time.perf_counter()
         
         # Do multiplication with transposed input
         self._buffers['_working'][:self.mapping.input_size, :, :batch_size] = (
@@ -142,21 +137,38 @@ class DenSparseMatrix(nn.Module):
             self.mapping.input_mask.unsqueeze(2) * 
             x.t().unsqueeze(1)
         )
+        t3 = time.perf_counter()
 
         # Rearrange each column according to mapping
         for k in range(self.mapping.mapping_width):
             self._buffers['_working'][:self.mapping.output_size, k, :batch_size] = (
                 self._buffers['_working'][self.mapping.output_mapping[:, k], k, :batch_size]
             )
+        t4 = time.perf_counter()
 
         # Apply output mask before summing
         self._buffers['_working'][:self.mapping.output_size, :, :batch_size] *= self.mapping.output_mask.unsqueeze(2)
+        t5 = time.perf_counter()
         
         # Sum and transpose back
         result = self._buffers['_working'][:self.mapping.output_size, :, :batch_size].sum(dim=1).t()
-        
+        t6 = time.perf_counter()
+
         # Return vector for single inputs
-        return result.squeeze(0) if was_vector else result
+        result = result.squeeze(0) if was_vector else result
+        t7 = time.perf_counter()
+
+        print(f"\nProfiling _multiply_matrix:")
+        print(f"Input handling: {(t1-t0)*1000:.3f}ms")
+        print(f"Zero working: {(t2-t1)*1000:.3f}ms")
+        print(f"Matrix multiply: {(t3-t2)*1000:.3f}ms")
+        print(f"Rearrange columns: {(t4-t3)*1000:.3f}ms")
+        print(f"Apply mask: {(t5-t4)*1000:.3f}ms")
+        print(f"Sum and transpose: {(t6-t5)*1000:.3f}ms")
+        print(f"Final reshape: {(t7-t6)*1000:.3f}ms")
+        print(f"Total time: {(t7-t0)*1000:.3f}ms")
+        
+        return result
 
     def __matmul__(self, other: torch.Tensor) -> torch.Tensor:
         return self.forward(other)

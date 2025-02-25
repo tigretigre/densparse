@@ -56,22 +56,22 @@ def create_random_sparse_matrix(size: int, density: int) -> Tuple[
             print(f"BSC not supported for size {size}: {e}")
             results['sparse']['cpu']['bsc'] = None
     
-    # Create MPS versions
+    # Create MPS versions if available
     if MPS_AVAILABLE:
         try:
-            # Create MPS DenSparse matrix and copy weights before moving to MPS
-            densparse_mps = DenSparseMatrix(mapping, max_batch=size)
+            # Create new mapping and matrix for MPS
+            mapping_mps = mapping.clone()
+            densparse_mps = DenSparseMatrix(mapping_mps, max_batch=size)
             with torch.no_grad():
                 densparse_mps.forward_weights.copy_(densparse_cpu.forward_weights)
-            # Now move everything to MPS
             densparse_mps = densparse_mps.to(MPS_DEVICE)
             results['densparse']['mps'] = densparse_mps
             
             # Create dense MPS matrix
-            dense_mps = dense_cpu.to(MPS_DEVICE)
+            dense_mps = dense_cpu.clone().to(MPS_DEVICE)
             results['dense']['mps'] = dense_mps
             
-            # Note: Skip sparse MPS formats for now as they're not supported
+            # Note: Skip sparse MPS formats as they're not supported
         except Exception as e:
             print(f"Error setting up MPS tensors: {e}")
             results['densparse']['mps'] = None

@@ -280,3 +280,12 @@ class DenSparseMapping:
             output_mapping=self.input_mapping,
             output_mask=self.input_mask,
         )
+
+    def clone(self) -> 'DenSparseMapping':
+        """Create a deep copy of this mapping."""
+        return DenSparseMapping(
+            self.input_mapping.clone(),
+            self.input_mask.clone(),
+            self.output_mapping.clone(),
+            self.output_mask.clone()
+        )
