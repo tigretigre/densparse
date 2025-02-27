@@ -8,9 +8,14 @@ from densparse.mapping_utils import square_cycle_mapping, up_cycle_mapping, down
 # FIXTURES
 
 @pytest.fixture
-def asymmetric_mapping():
-    """Create a 10x5 mapping with alternating connection patterns."""
+def down_asymmetric_mapping():
+    """Create a 10x5 mapping with down-cycle connection pattern."""
     return down_cycle_mapping(10, 5, 3)
+
+@pytest.fixture
+def up_asymmetric_mapping():
+    """Create a 5x10 mapping with up-cycle connection pattern."""
+    return up_cycle_mapping(5, 10, 3)
 
 @pytest.fixture
 def manual_mapping():
@@ -29,7 +34,7 @@ def manual_mapping():
 
 # TESTS
 
-@pytest.mark.parametrize("mapping_fixture", ["asymmetric_mapping", "manual_mapping"])
+@pytest.mark.parametrize("mapping_fixture", ["down_asymmetric_mapping", "manual_mapping"])
 def test_input_connections(mapping_fixture, request):
     """Test that each input row has exactly three unmasked connections."""
     mapping = request.getfixturevalue(mapping_fixture)
@@ -40,7 +45,7 @@ def test_input_connections(mapping_fixture, request):
     for row in range(10):
         unmasked_count = matrix.forward_mask[row, :].sum().item()
         assert unmasked_count == half_width, f"Row {row} has {unmasked_count} unmasked connections, expected {half_width}"
-        if mapping_fixture == "asymmetric_mapping":
+        if mapping_fixture == "down_asymmetric_mapping":
             # Verify the correct half is unmasked
             if row % 2 == 0:
                 # First three should be unmasked
@@ -52,7 +57,7 @@ def test_input_connections(mapping_fixture, request):
                 assert matrix.forward_mask[row, half_width:].all()
 
 
-@pytest.mark.parametrize("mapping_fixture", ["asymmetric_mapping", "manual_mapping"])
+@pytest.mark.parametrize("mapping_fixture", ["down_asymmetric_mapping", "manual_mapping"])
 def test_output_connections(mapping_fixture, request):
     """Test that no outputs have masked connections."""
     mapping = request.getfixturevalue(mapping_fixture)
@@ -66,7 +71,7 @@ def test_output_connections(mapping_fixture, request):
         assert matrix.reverse_mask[out_idx].any(), f"Output {out_idx} has no unmasked connections"
 
 
-@pytest.mark.parametrize("mapping_fixture", ["asymmetric_mapping", "manual_mapping"])
+@pytest.mark.parametrize("mapping_fixture", ["down_asymmetric_mapping", "manual_mapping"])
 def test_bidirectional_mapping(mapping_fixture, request):
     """Test that all unmasked connections are bidirectional."""
     mapping = request.getfixturevalue(mapping_fixture)
@@ -88,28 +93,6 @@ def test_bidirectional_mapping(mapping_fixture, request):
                 in_idx = matrix.reverse_mapping[out_idx, rev_idx].item()
                 assert matrix.forward_mask[in_idx, rev_idx], f"No forward mapping found for {in_idx}->{out_idx}, column {rev_idx}"
                 assert matrix.forward_mapping[in_idx, rev_idx].item() == out_idx, f"Forward mapping mismatch for {in_idx}->{out_idx}, column {rev_idx}"
-
-
-@pytest.mark.parametrize("mapping_fixture", ["asymmetric_mapping", "manual_mapping"])
-def test_weight_symmetry(mapping_fixture, request):
-    """Test that weights are properly copied between forward and reverse matrices."""
-    mapping = request.getfixturevalue(mapping_fixture)
-    matrix = DenSparseMatrix(mapping)
-    torch.manual_seed(42)
-
-    # Set random weights in forward matrix
-    with torch.no_grad():
-        matrix.forward_weights.random_()
-        matrix._update_reverse_weights()
-
-    # Check each unmasked forward weight has matching reverse weight
-    for in_idx in range(10):
-        for fw_idx in range(6):
-            if matrix.forward_mask[in_idx, fw_idx]:
-                out_idx = matrix.forward_mapping[in_idx, fw_idx].item()
-                forward_weight = matrix.forward_weights[in_idx, fw_idx].item()
-                reverse_weight = matrix.reverse_weights[out_idx, fw_idx].item()
-                assert abs(forward_weight - reverse_weight) < 1e-6, f"Weight mismatch for {in_idx}->{out_idx}, column {fw_idx}: {forward_weight} != {reverse_weight}\n"
 
 
 def test_random_mask_mappings():
@@ -142,43 +125,18 @@ def test_random_mask_mappings():
             f"Direct transpose doesn't match from_mask(transpose) for size {out_size}x{in_size}"
 
 
-def test_asymmetric_mapping_equivalence(asymmetric_mapping, manual_mapping):
+def test_asymmetric_mapping_equivalence(down_asymmetric_mapping, manual_mapping):
     """Test that different mappings of the same connectivity pattern are equivalent."""
 
     # Verify both mappings produce the same connectivity
-    assert torch.equal(asymmetric_mapping.to_dense(), manual_mapping.to_dense()), \
+    assert torch.equal(down_asymmetric_mapping.to_dense(), manual_mapping.to_dense()), \
         "Function-based and mask-based mappings differ"
 
     # Verify their transposes also match
     assert torch.equal(
-        asymmetric_mapping.transpose().to_dense(),
+        down_asymmetric_mapping.transpose().to_dense(),
         manual_mapping.transpose().to_dense()
     ), "Transposed mappings differ"
-
-
-def test_mapping_properties():
-    """Test basic properties of the mapping matrices."""
-    torch.manual_seed(42)
-
-    # Create a random mask
-    mask = torch.rand(8, 12) < 0.3
-    mapping = DenSparseMapping.from_mask(mask)
-
-    # Test that all indices are valid (0 or greater)
-    assert (mapping.input_mapping >= 0).all(), "All input mapping indices should be non-negative"
-    assert (mapping.output_mapping >= 0).all(), "All output mapping indices should be non-negative"
-
-    # Test that all indices are within bounds
-    assert (mapping.input_mapping < mapping.output_size).all(), \
-        "All input mapping indices should be within output size"
-    assert (mapping.output_mapping < mapping.input_size).all(), \
-        "All output mapping indices should be within input size"
-
-    # Test that unmasked entries have valid indices (redundant but explicit test)
-    assert (mapping.input_mapping[mapping.input_mask] < mapping.output_size).all(), \
-        "Input mapping indices should be within output size"
-    assert (mapping.output_mapping[mapping.output_mask] < mapping.input_size).all(), \
-        "Output mapping indices should be within input size"
 
 
 def test_invalid_bidirectional_mapping():
@@ -191,3 +149,49 @@ def test_invalid_bidirectional_mapping():
 
     with pytest.raises(ValueError, match=r"Multiple inputs .* mapping to output 0 in column 0"):
         DenSparseMapping.from_function(5, 5, 2, invalid_map)
+
+
+@pytest.mark.parametrize("mapping_fixture", ["down_asymmetric_mapping", "up_asymmetric_mapping", "manual_mapping"])
+def test_mapping_index_validity(mapping_fixture, request):
+    """Test that mapping indices are valid for safe scatter operations."""
+    mapping = request.getfixturevalue(mapping_fixture)
+    max_size = max(mapping.input_size, mapping.output_size)
+
+    sets = [
+        ('input', mapping.input_mapping, mapping.input_mask, mapping.input_size),
+        ('output', mapping.output_mapping, mapping.output_mask, mapping.output_size),
+    ]
+    LABEL = 0
+    MAPPING = 1
+    MASK = 2
+    SIZE = 3
+    
+    for toggle in range(2):
+        for col in range(mapping.mapping_width):
+            set_a = sets[toggle]
+            set_b = sets[1 - toggle]
+            indices = set_a[MAPPING][:, col]
+            print(set_a[MAPPING][:, col])
+            print(set_a[MASK][:, col])
+            print(set_b[MAPPING][:, col])
+            print(set_b[MASK][:, col])
+            # All indices should be within valid range
+            assert (indices >= 0).all() and (indices < max_size).all(), \
+                f"{set_a[LABEL]} mapping indices in column {col} outside valid range [0, {max_size-1}]"
+            
+            # All indices in column should be unique
+            assert len(indices) == len(indices.unique()), \
+                f"Found duplicate indices in {set_a[LABEL]}_mapping column {col}"
+            
+            # Active indices should map to active outputs
+            active_indices = indices[set_a[MASK][:, col]]
+            for idx in active_indices:
+                assert set_b[MASK][idx, col], \
+                    f"{set_a[LABEL]} maps to {idx} but {set_b[LABEL]}_mask[{idx},{col}] is False"
+            
+            # Inactive indices should map to inactive outputs or out of range
+            inactive_indices = indices[~set_a[MASK][:, col]]
+            for idx in inactive_indices:
+                if idx < set_b[SIZE]:
+                    assert not set_b[MASK][idx, col], \
+                        f"Inactive {set_a[LABEL]} maps to active {set_b[LABEL]} at {idx} in column {col}"

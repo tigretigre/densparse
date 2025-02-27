@@ -151,6 +151,7 @@ class DenSparseMapping:
         input_mask: torch.Tensor,
         output_mapping: torch.Tensor,
         output_mask: torch.Tensor,
+        fill_inactive_cells: bool = True
     ):
         """Initialize with pre-computed mapping matrices.
 
@@ -159,6 +160,7 @@ class DenSparseMapping:
             input_mask: (input_size, width) boolean tensor
             output_mapping: (output_size, width) tensor of input indices
             output_mask: (output_size, width) boolean tensor
+            fill_inactive_cells: If True, fill inactive cells with valid unused indices
         """
         assert input_mapping.shape == input_mask.shape
         assert output_mapping.shape == output_mask.shape
@@ -172,6 +174,27 @@ class DenSparseMapping:
         self.input_size = input_mapping.size(0)
         self.output_size = output_mapping.size(0)
         self.mapping_width = input_mapping.size(1)
+
+        if fill_inactive_cells:
+            max_size = max(self.input_size, self.output_size)
+            
+            # Track used indices in each column
+            for col in range(self.mapping_width):                
+                # Get unused indices
+                in_index_used = torch.zeros(max_size, dtype=torch.bool)
+                out_index_used = torch.zeros(max_size, dtype=torch.bool)
+                in_index_used[self._input_mapping[self._input_mask[:, col], col]] = True
+                out_index_used[self._output_mapping[self._output_mask[:, col], col]] = True
+                unused_in_indices = torch.where(~in_index_used)[0]
+                unused_out_indices = torch.where(~out_index_used)[0]
+
+                # Fill inactive input cells
+                inactive_in = ~self._input_mask[:, col]
+                self._input_mapping[inactive_in, col] = unused_in_indices[:min(self.input_size, inactive_in.sum())]
+
+                # Fill inactive output cells
+                inactive_out = ~self._output_mask[:, col]
+                self._output_mapping[inactive_out, col] = unused_out_indices[:min(self.output_size, inactive_out.sum())]
 
     @property
     def input_mapping(self):
@@ -212,13 +235,17 @@ class DenSparseMapping:
         output_size: int,
         mapping_width: int,
         mapping_function: Callable[[int, int], Tuple[int, bool]],
+        handles_inactive_cells: bool = True
     ) -> 'DenSparseMapping':
         """Create mapping matrices from a mapping function.
         
-        Raises:
-            ValueError: If the mapping function creates invalid bidirectional connections
+        Args:
+            input_size: Number of input nodes
+            output_size: Number of output nodes
+            mapping_width: Width of mapping matrices
+            mapping_function: Function(input_idx, weight_idx) -> (output_idx, is_active)
+            handles_inactive_cells: If True, function provides valid mappings for inactive cells
         """
-        max_size = max(input_size, output_size)
         input_mapping = torch.zeros(input_size, mapping_width, dtype=torch.long)
         input_mask = torch.zeros(input_size, mapping_width, dtype=torch.bool)
         output_mapping = torch.zeros(output_size, mapping_width, dtype=torch.long)
@@ -229,13 +256,25 @@ class DenSparseMapping:
                 out_idx, mask = mapping_function(row, col)
                 input_mapping[row, col] = out_idx
                 input_mask[row, col] = mask
-                if mask:
-                    if output_mask[out_idx, col]:
+                if mask or handles_inactive_cells:
+                    if mask and output_mask[out_idx, col]:
                         raise ValueError(f"Multiple inputs ({row} and {output_mapping[out_idx, col]}) mapping to output {out_idx} in column {col}")
-                    output_mapping[out_idx, col] = row
-                    output_mask[out_idx, col] = mask
+                    if out_idx < output_size:
+                        output_mapping[out_idx, col] = row
+                        output_mask[out_idx, col] = mask
+                    elif mask:
+                        raise ValueError(f"Output index {out_idx} is out of range for mapping width {mapping_width}")
+        if output_size > input_size:
+            for col in range(mapping_width):
+                output_mapping[~output_mask[:, col], col] = torch.arange(input_size, output_size, dtype=torch.long)
 
-        return cls(input_mapping, input_mask, output_mapping, output_mask)
+        return cls(
+            input_mapping,
+            input_mask,
+            output_mapping,
+            output_mask,
+            fill_inactive_cells=not handles_inactive_cells
+        )
 
     @classmethod
     def from_mask(cls, mask_matrix: torch.Tensor) -> 'DenSparseMapping':

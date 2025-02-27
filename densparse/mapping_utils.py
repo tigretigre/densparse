@@ -61,10 +61,14 @@ def down_cycle_mapping(input_size: int, output_size: int, max_out: int) -> DenSp
         column_group = input_idx % ratio
         
         # If weight_idx is in the column group, return the output
-        if weight_idx // max_out == column_group:
+        active_group = weight_idx // max_out
+        if active_group == column_group:
             offset = weight_idx % max_out - max_out // 2
             return ((base_output + offset) % output_size, True)
-        return (0, False)
+        return (
+            output_size + input_idx - base_output - (active_group < column_group),
+            False,
+        )
     
     return DenSparseMapping.from_function(input_size, output_size, width, mapping_func)
 

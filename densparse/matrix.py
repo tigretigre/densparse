@@ -4,6 +4,9 @@ from typing import Callable, Tuple
 from densparse.mapping import DenSparseMapping
 import time
 
+INPUT_BATCH_SLICE = 0
+OUTPUT_BATCH_SLICE = 1
+
 class DenSparseMatrix(nn.Module):
     def __init__(self, mapping: DenSparseMapping, max_batch: int = 32):
         """
@@ -29,7 +32,7 @@ class DenSparseMatrix(nn.Module):
         max_size = max(mapping.input_size, mapping.output_size)
         self.register_buffer(
             '_working',
-            torch.zeros(max_size, mapping.mapping_width, max_batch)
+            torch.zeros(max_size, mapping.mapping_width, 2 * max(1, max_batch))
         )
 
     @property
@@ -67,6 +70,13 @@ class DenSparseMatrix(nn.Module):
         """Input-side weight matrix."""
         return self._parameters['_forward_weights_param']
 
+    @forward_weights.setter
+    def forward_weights(self, value: torch.Tensor):
+        """Set input-side weights, applying mask."""
+        with torch.no_grad():
+            self._parameters['_forward_weights_param'].copy_(value)
+            self._parameters['_forward_weights_param'] *= self.mapping.input_mask
+
     @property
     def reverse_weights(self) -> torch.Tensor:
         """Output-side weight matrix."""
@@ -75,21 +85,20 @@ class DenSparseMatrix(nn.Module):
     def _update_reverse_weights(self):
         """Update reverse weights to match forward weights using the mappings."""
         with torch.no_grad():
-            # Zero out working area (using just the first batch slice)
-            self._buffers['_working'][self.mapping.input_size:, :, 0].zero_()
-            
-            # Copy forward weights into working area
-            self._buffers['_working'][:self.mapping.input_size, :, 0] = self._parameters['_forward_weights_param']
-            
-            # Rearrange each column according to mapping
-            for k in range(self.mapping.mapping_width):
-                self._buffers['_working'][:self.mapping.output_size, k, 0] = (
-                    self._buffers['_working'][self.mapping.output_mapping[:, k], k, 0]
-                )
-            
+            # Zero working area (using just the first two batch slice)
+            self._buffers['_working'][self.mapping.input_size:self.mapping.output_size, :, INPUT_BATCH_SLICE:OUTPUT_BATCH_SLICE+1].zero_()
+            self._buffers['_working'][:self.mapping.input_size, :, INPUT_BATCH_SLICE].copy_(
+                self._parameters['_forward_weights_param']
+            )
+            # Scatter from input region to output region (using second batch slice)
+            self._buffers['_working'][:max(self.mapping.input_size, self.mapping.output_size), :, OUTPUT_BATCH_SLICE].scatter_(
+                0,  # dim to scatter along (output dimension)
+                self.mapping.input_mapping,  # indices tensor
+                self._buffers['_working'][:self.mapping.input_size, :, INPUT_BATCH_SLICE]  # source
+            )
             # Copy to reverse weights
             self._parameters['_reverse_weights_param'].copy_(
-                self._buffers['_working'][:self.mapping.output_size, :, 0]
+                self._buffers['_working'][:self.mapping.output_size, :, OUTPUT_BATCH_SLICE]
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -116,7 +125,7 @@ class DenSparseMatrix(nn.Module):
             Output tensor of shape (batch_size, output_size) for batches
             or (output_size,) for single inputs
         """
-        t0 = time.perf_counter()
+        #t0 = time.perf_counter()
         # Handle vector vs batch input
         was_vector = x.dim() == 1
         if was_vector:
@@ -125,48 +134,45 @@ class DenSparseMatrix(nn.Module):
         batch_size = x.shape[0]
         if batch_size > self.max_batch:
             raise ValueError(f"Batch size {batch_size} exceeds maximum {self.max_batch}")
-        t1 = time.perf_counter()
+        #t1 = time.perf_counter()
 
         # Zero out working area
-        self._buffers['_working'][..., :batch_size].zero_()
-        t2 = time.perf_counter()
+        self._buffers['_working'][:self.mapping.input_size, :, :batch_size].copy_(
+            self._parameters['_forward_weights_param'].unsqueeze(2)
+        )
+        #t2 = time.perf_counter()
         
         # Do multiplication with transposed input
-        self._buffers['_working'][:self.mapping.input_size, :, :batch_size] = (
-            self._parameters['_forward_weights_param'].unsqueeze(2) * 
-            self.mapping.input_mask.unsqueeze(2) * 
-            x.t().unsqueeze(1)
-        )
-        t3 = time.perf_counter()
-
-        # Rearrange each column according to mapping
-        for k in range(self.mapping.mapping_width):
-            self._buffers['_working'][:self.mapping.output_size, k, :batch_size] = (
-                self._buffers['_working'][self.mapping.output_mapping[:, k], k, :batch_size]
-            )
-        t4 = time.perf_counter()
-
-        # Apply output mask before summing
-        self._buffers['_working'][:self.mapping.output_size, :, :batch_size] *= self.mapping.output_mask.unsqueeze(2)
-        t5 = time.perf_counter()
+        self._buffers['_working'][:self.mapping.input_size, :, :batch_size] *= x.t().unsqueeze(1)
+        #t3 = time.perf_counter()
         
-        # Sum and transpose back
-        result = self._buffers['_working'][:self.mapping.output_size, :, :batch_size].sum(dim=1).t()
-        t6 = time.perf_counter()
+        # Create index tensor for scatter operation
+        index = self.mapping.input_mapping.unsqueeze(-1).expand(-1, -1, batch_size)
+        
+        # Scatter directly into output region of working buffer
+        self._buffers['_working'][:max(self.mapping.input_size, self.mapping.output_size), :, batch_size:2*batch_size].scatter_(
+            0,  # dim to scatter along
+            index,  # indices tensor
+            self._buffers['_working'][:self.mapping.input_size, :, :batch_size]  # source
+        )
+        
+        # Sum along mapping width dimension
+        result = self._buffers['_working'][:self.mapping.output_size, :, batch_size:2*batch_size].sum(dim=1)
+        
+        # Return single vector if input was single vector
+        if x.size(0) == 1:
+            result = result.squeeze(1)
+        else:
+            result = result.t()
+        
+        #t4 = time.perf_counter()
 
-        # Return vector for single inputs
-        result = result.squeeze(0) if was_vector else result
-        t7 = time.perf_counter()
-
-        print(f"\nProfiling _multiply_matrix:")
-        print(f"Input handling: {(t1-t0)*1000:.3f}ms")
-        print(f"Zero working: {(t2-t1)*1000:.3f}ms")
-        print(f"Matrix multiply: {(t3-t2)*1000:.3f}ms")
-        print(f"Rearrange columns: {(t4-t3)*1000:.3f}ms")
-        print(f"Apply mask: {(t5-t4)*1000:.3f}ms")
-        print(f"Sum and transpose: {(t6-t5)*1000:.3f}ms")
-        print(f"Final reshape: {(t7-t6)*1000:.3f}ms")
-        print(f"Total time: {(t7-t0)*1000:.3f}ms")
+        #print(f"\nProfiling _multiply_matrix:")
+        #print(f"Input handling: {(t1-t0)*1000:.3f}ms")
+        #print(f"Zero working: {(t2-t1)*1000:.3f}ms")
+        #print(f"Matrix multiply: {(t3-t2)*1000:.3f}ms")
+        #print(f"Scatter: {(t4-t3)*1000:.3f}ms")
+        #print(f"Final reshape: {(t4-t0)*1000:.3f}ms")
         
         return result
 
@@ -274,6 +280,7 @@ class DenSparseMatrix(nn.Module):
         """Initialize weights with random values from N(0,1)."""
         with torch.no_grad():
             self._parameters['_forward_weights_param'].normal_()
+            self._parameters['_forward_weights_param'] *= self.mapping.input_mask
             self._update_reverse_weights()
 
     def get_weight(self, input_idx: int, output_idx: int) -> float:

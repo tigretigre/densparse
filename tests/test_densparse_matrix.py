@@ -3,6 +3,9 @@ import pytest
 from densparse import DenSparseMapping, DenSparseMatrix
 from densparse.mapping_utils import square_cycle_mapping, up_cycle_mapping, down_cycle_mapping
 
+
+# FIXTURES
+
 @pytest.fixture
 def cyclic_mapping_20():
     """Create a mapping for a 20x20 matrix with ±2 cyclic connectivity pattern."""
@@ -17,6 +20,33 @@ def mapping_20_to_10():
 def mapping_10_to_20():
     """Create a mapping for a 20x10 matrix (20 outputs, 10 inputs)."""
     return up_cycle_mapping(10, 20, 6)
+
+@pytest.fixture
+def asymmetric_mapping():
+    """Create a 10x5 mapping with alternating connection patterns."""
+    return down_cycle_mapping(10, 5, 3)
+
+@pytest.fixture
+def manual_mapping():
+    """Create a 10x5 mapping using an explicit mask matrix."""
+    mask = torch.zeros(5, 10, dtype=torch.bool)
+
+    # Create same pattern as asymmetric_mapping but with explicit mask
+    for in_idx in range(10):
+        base_out = in_idx // 2
+        mask[base_out, in_idx] = True
+        mask[(base_out - 1) % 5, in_idx] = True
+        mask[(base_out + 1) % 5, in_idx] = True
+
+    return DenSparseMapping.from_mask(mask)
+
+@pytest.fixture
+def down_asymmetric_mapping():
+    """Create a 10x5 mapping with alternating connection patterns."""
+    return down_cycle_mapping(10, 5, 3)
+
+
+# TESTS
 
 def test_matrix_multiply_dense_vector(cyclic_mapping_20):
     sparse_mat = DenSparseMatrix(cyclic_mapping_20)
@@ -79,7 +109,7 @@ def test_matrix_transpose(mapping_20_to_10):
     # Test multiplication with vector using transposed matrices
     x = torch.randn(10)
     
-    # Print cell-by-cell multiplication for dense transpose
+    # Cell-by-cell multiplication for dense transpose
     for i in range(dense_transpose.shape[0]):  # 20 rows
         row_sum = 0
         for j in range(dense_transpose.shape[1]):  # 10 cols
@@ -148,19 +178,25 @@ def test_matrix_gradients(cyclic_mapping_20):
     mask = sparse_mat.mapping.to_dense()
     assert torch.allclose(sparse_grads[mask], dense_grads[mask], atol=1e-6)
 
-def test_random_weight_initialization():
-    """Test random weight initialization."""
-    mapping = square_cycle_mapping(10, 10, 3)
-    matrix = DenSparseMatrix(mapping)
+def test_random_weight_initialization(down_asymmetric_mapping):
+    """Test that random weight initialization works correctly."""
+    matrix = DenSparseMatrix(down_asymmetric_mapping)
     
     # Should start with zero weights
     assert torch.all(matrix.forward_weights == 0)
+# Set random seed for reproducibility
+    torch.manual_seed(42)
     
     # Randomize weights
     matrix.randomize_weights()
     
     # Weights should be non-zero
     assert not torch.all(matrix.forward_weights == 0)
+
+    assert torch.all(matrix.forward_weights * ~matrix.mapping.input_mask == 0), \
+        "Forward weights should be zero for inactive cells"
+    assert torch.all(matrix.reverse_weights * ~matrix.mapping.output_mask == 0), \
+        "Reverse weights should be zero for inactive cells"
     
     # Forward and reverse weights should match through the mapping
     dense = matrix.to_dense()
@@ -203,7 +239,37 @@ def test_from_dense():
     # Check dense conversion matches original
     converted = sparse.to_dense()
     assert torch.allclose(dense, converted)
-    
+    print(sparse.forward_mapping)
+    print(sparse.reverse_mapping)
+    print(sparse.forward_weights)
+    print(sparse.reverse_weights)
+    print(sparse.mapping.input_mask)
+    print(sparse.mapping.output_mask)
     # Test multiplication gives same result
     x = torch.randn(20)
-    assert torch.allclose(sparse @ x, dense @ x)
+    print(sparse @ x)
+    print(dense @ x)
+    print(sparse.to_dense() @ x)
+    print(sparse.to_dense())
+    print(dense)
+    assert torch.allclose(sparse @ x, dense @ x), f"Sparse result:\n {sparse @ x}\nDense result:\n {dense @ x}"
+
+@pytest.mark.parametrize("mapping_fixture", ["asymmetric_mapping", "manual_mapping"])
+def test_weight_symmetry(mapping_fixture, request):
+    """Test that weights are properly copied between forward and reverse matrices."""
+    mapping = request.getfixturevalue(mapping_fixture)
+    matrix = DenSparseMatrix(mapping)
+    torch.manual_seed(42)
+
+    # Set random weights in forward matrix
+    with torch.no_grad():
+        matrix.randomize_weights()
+    transpose = matrix.transpose()
+
+    # Check that weights match between forward and reverse matrices
+    for i in range(matrix.input_size):
+        for j in range(matrix.output_size):
+            if matrix.mapping.input_mask[i, j]:
+                assert matrix.get_weight(i, j) == transpose.get_weight(j, i), \
+                    f"Weight mismatch at ({i}, {j}) {matrix.get_weight(i, j)} != {transpose.get_weight(j, i)}"
+
