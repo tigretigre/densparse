@@ -1,15 +1,20 @@
-import torch
+import math
 import time
-import pandas as pd
 from typing import Tuple, Dict, Optional
+
+import pandas as pd
+import torch
+
 from densparse import DenSparseMatrix
 from densparse.mapping_utils import square_cycle_mapping
 
 # Check if MPS is available
 MPS_AVAILABLE = torch.backends.mps.is_available()
+CUDA_AVAILABLE = torch.cuda.is_available()
 CPU_DEVICE = torch.device("cpu")
-MPS_DEVICE = torch.device("mps") if MPS_AVAILABLE else CPU_DEVICE
-
+GPU_DEVICE = torch.device("cuda") if CUDA_AVAILABLE else torch.device("mps") if MPS_AVAILABLE else CPU_DEVICE
+GPU_AVAILABLE = CUDA_AVAILABLE or MPS_AVAILABLE
+synchronize = torch.mps.synchronize if GPU_DEVICE == torch.device("mps") else torch.cuda.synchronize if GPU_DEVICE == torch.device("cuda") else None
 # Check if MKL is available
 MKL_AVAILABLE = torch.backends.mkl.is_available() if hasattr(torch.backends, 'mkl') else False
 
@@ -22,7 +27,7 @@ def create_random_sparse_matrix(size: int, density: int) -> Tuple[
     results = {
         'densparse': {},
         'dense': {},
-        'sparse': {'cpu': {}, 'mps': {}}
+        'sparse': {'cpu': {}, 'gpu': {}}
     }
     
     # Create mapping
@@ -43,7 +48,7 @@ def create_random_sparse_matrix(size: int, density: int) -> Tuple[
     results['sparse']['cpu']['csc'] = dense_cpu.to_sparse_csc()
     
     # Create MKL-dependent formats only if available
-    if MKL_AVAILABLE:
+    if MKL_AVAILABLE and MPS_AVAILABLE:
         try:
             results['sparse']['cpu']['bsr'] = dense_cpu.to_sparse_bsr(blocksize=min(size, 4))
         except Exception as e:
@@ -56,26 +61,29 @@ def create_random_sparse_matrix(size: int, density: int) -> Tuple[
             print(f"BSC not supported for size {size}: {e}")
             results['sparse']['cpu']['bsc'] = None
     
-    # Create MPS versions if available
-    if MPS_AVAILABLE:
+    # Create gpu versions if available
+    if GPU_AVAILABLE:
         try:
-            # Create new mapping and matrix for MPS
-            mapping_mps = mapping.clone()
-            densparse_mps = DenSparseMatrix(mapping_mps, max_batch=size)
+            # Create new mapping and matrix for gpu
+            mapping_gpu = mapping.clone()
+            densparse_gpu = DenSparseMatrix(mapping_gpu, max_batch=size)
             with torch.no_grad():
-                densparse_mps.forward_weights.copy_(densparse_cpu.forward_weights)
-            densparse_mps = densparse_mps.to(MPS_DEVICE)
-            results['densparse']['mps'] = densparse_mps
+                densparse_gpu.forward_weights.copy_(densparse_cpu.forward_weights)
+            densparse_gpu = densparse_gpu.to(GPU_DEVICE)
+            results['densparse']['gpu'] = densparse_gpu
             
-            # Create dense MPS matrix
-            dense_mps = dense_cpu.clone().to(MPS_DEVICE)
-            results['dense']['mps'] = dense_mps
+            # Create dense gpu matrix
+            dense_gpu = dense_cpu.clone().to(GPU_DEVICE)
+            results['dense']['gpu'] = dense_gpu
             
-            # Note: Skip sparse MPS formats as they're not supported
+            if CUDA_AVAILABLE:
+                results['sparse']['gpu']['coo'] = dense_gpu.to_sparse()
+                results['sparse']['gpu']['csr'] = dense_gpu.to_sparse_csr()
+                results['sparse']['gpu']['csc'] = dense_gpu.to_sparse_csc()
         except Exception as e:
-            print(f"Error setting up MPS tensors: {e}")
-            results['densparse']['mps'] = None
-            results['dense']['mps'] = None
+            print(f"Error setting up gpu tensors: {e}")
+            results['densparse']['gpu'] = None
+            results['dense']['gpu'] = None
     
     return results['densparse'], results['dense'], results['sparse']
 
@@ -85,7 +93,7 @@ def benchmark_matrix_multiply(sizes: range, densities: range, n_trials: int = 10
     
     for size in sizes:
         for density in densities:
-            if density > size:
+            if density > math.sqrt(size):
                 continue
                 
             print(f"Testing size={size}, density={density}", flush=True)
@@ -98,7 +106,7 @@ def benchmark_matrix_multiply(sizes: range, densities: range, n_trials: int = 10
             
             # Create batch tensors for testing
             batch_cpu = torch.randn(size, size)
-            batch_mps = batch_cpu.to(MPS_DEVICE) if MPS_AVAILABLE else None
+            batch_gpu = batch_cpu.to(GPU_DEVICE) if GPU_AVAILABLE else None
             
             # Time multiplications
             times = {
@@ -111,12 +119,15 @@ def benchmark_matrix_multiply(sizes: range, densities: range, n_trials: int = 10
                 if sparse_mats['cpu'][fmt] is not None:
                     times[f'sparse_cpu_{fmt}_x_dense'] = []
             
-            # Add MPS implementations if available
-            if MPS_AVAILABLE and batch_mps is not None:
-                if densparse_mats.get('mps') is not None:
-                    times['densparse_mps_x_dense'] = []
-                if dense_mats.get('mps') is not None:
-                    times['dense_mps_x_dense'] = []
+            # Add GPU implementations if available
+            if GPU_AVAILABLE and batch_gpu is not None:
+                if densparse_mats.get('gpu') is not None:
+                    times['densparse_gpu_x_dense'] = []
+                if dense_mats.get('gpu') is not None:
+                    times['dense_gpu_x_dense'] = []
+                for fmt in sparse_mats['gpu']:
+                    if sparse_mats['gpu'][fmt] is not None:
+                        times[f'sparse_gpu_{fmt}_x_dense'] = []
             
             for _ in range(n_trials):
                 # CPU implementations
@@ -138,22 +149,29 @@ def benchmark_matrix_multiply(sizes: range, densities: range, n_trials: int = 10
                         except Exception as e:
                             print(f"CPU {fmt} multiplication failed: {e}")
                 
-                # MPS implementations
-                if MPS_AVAILABLE and batch_mps is not None:
-                    if densparse_mats.get('mps') is not None:
-                        torch.mps.synchronize()
+                # GPU implementations
+                if GPU_AVAILABLE and batch_gpu is not None:
+                    if densparse_mats.get('gpu') is not None:
+                        synchronize()
                         t0 = time.perf_counter()
-                        _ = densparse_mats['mps'] @ batch_mps
-                        torch.mps.synchronize()
-                        times['densparse_mps_x_dense'].append(time.perf_counter() - t0)
+                        _ = densparse_mats['gpu'] @ batch_gpu
+                        synchronize()
+                        times['densparse_gpu_x_dense'].append(time.perf_counter() - t0)
                     
-                    if dense_mats.get('mps') is not None:
-                        torch.mps.synchronize()
+                    if dense_mats.get('gpu') is not None:
+                        synchronize()
                         t0 = time.perf_counter()
-                        _ = dense_mats['mps'] @ batch_mps
-                        torch.mps.synchronize()
-                        times['dense_mps_x_dense'].append(time.perf_counter() - t0)
-            
+                        _ = dense_mats['gpu'] @ batch_gpu
+                        synchronize()
+                        times['dense_gpu_x_dense'].append(time.perf_counter() - t0)
+
+                    for fmt in sparse_mats['gpu']:
+                        if sparse_mats['gpu'][fmt] is not None:
+                            synchronize()
+                            t0 = time.perf_counter()
+                            _ = sparse_mats['gpu'][fmt] @ batch_gpu
+                            synchronize()
+                            times[f'sparse_gpu_{fmt}_x_dense'].append(time.perf_counter() - t0)
             # Record average times
             results.append({
                 'size': size,
@@ -169,10 +187,10 @@ MAX_POWER = 8
 
 if __name__ == '__main__':
     # Print system info
-    print(f"MPS available: {MPS_AVAILABLE}")
+    print(f"GPU available: {GPU_AVAILABLE}")
     print(f"MKL available: {MKL_AVAILABLE}")
-    if MPS_AVAILABLE:
-        print(f"MPS device: {MPS_DEVICE}")
+    if GPU_AVAILABLE:
+        print(f"GPU device: {GPU_DEVICE}")
         print(f"PyTorch version: {torch.__version__}")
     
     sizes = [2**i for i in range(1, MAX_POWER + 1)]
