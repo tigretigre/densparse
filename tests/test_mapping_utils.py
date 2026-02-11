@@ -93,4 +93,91 @@ def test_invalid_ratios():
         up_cycle_mapping(10, 15, 3)  # 1.5x is invalid
         
     with pytest.raises(ValueError, match="must be multiple"):
-        down_cycle_mapping(15, 10, 3)  # 1.5x is invalid 
+        down_cycle_mapping(15, 10, 3)  # 1.5x is invalid
+
+
+# ============================================================================
+# Tests for offset parameter
+# ============================================================================
+
+def test_square_cycle_offset_zero_is_default():
+    """Offset=0 should produce same result as no offset."""
+    size = 10
+    max_out = 3
+    m_default = square_cycle_mapping(size, size, max_out)
+    m_zero = square_cycle_mapping(size, size, max_out, offset=0)
+    
+    assert torch.equal(m_default.to_dense(), m_zero.to_dense())
+
+
+def test_square_cycle_offset_positive():
+    """Offset=1 shifts all outputs by 1."""
+    size = 10
+    max_out = 3
+    m0 = square_cycle_mapping(size, size, max_out, offset=0)
+    m1 = square_cycle_mapping(size, size, max_out, offset=1)
+    
+    dense0 = m0.to_dense()
+    dense1 = m1.to_dense()
+    
+    # m1's pattern should be m0's pattern shifted by 1 in output dimension
+    # i.e., dense1[i, j] == dense0[(i-1) % size, j]
+    shifted = torch.roll(dense0, shifts=1, dims=0)
+    assert torch.equal(dense1, shifted)
+
+
+def test_square_cycle_offset_negative():
+    """Offset=-1 shifts all outputs by -1."""
+    size = 10
+    max_out = 3
+    m0 = square_cycle_mapping(size, size, max_out, offset=0)
+    m_neg = square_cycle_mapping(size, size, max_out, offset=-1)
+    
+    dense0 = m0.to_dense()
+    dense_neg = m_neg.to_dense()
+    
+    # Pattern shifted by -1
+    shifted = torch.roll(dense0, shifts=-1, dims=0)
+    assert torch.equal(dense_neg, shifted)
+
+
+def test_square_cycle_offset_wraparound():
+    """Offset larger than size should wrap around correctly."""
+    size = 10
+    max_out = 3
+    m1 = square_cycle_mapping(size, size, max_out, offset=1)
+    m11 = square_cycle_mapping(size, size, max_out, offset=11)  # 11 % 10 = 1
+    
+    assert torch.equal(m1.to_dense(), m11.to_dense())
+
+
+def test_up_cycle_offset_positive():
+    """Offset works with up_cycle_mapping (non-square)."""
+    input_size = 10
+    output_size = 20
+    max_out = 6
+    
+    m0 = up_cycle_mapping(input_size, output_size, max_out, offset=0)
+    m2 = up_cycle_mapping(input_size, output_size, max_out, offset=2)
+    
+    dense0 = m0.to_dense()
+    dense2 = m2.to_dense()
+    
+    # Pattern shifted by 2 in output dimension
+    shifted = torch.roll(dense0, shifts=2, dims=0)
+    assert torch.equal(dense2, shifted)
+
+
+def test_offset_preserves_connectivity_counts():
+    """Offset should not change number of connections per node."""
+    size = 10
+    max_out = 5
+    
+    for offset in [-3, -1, 0, 1, 3, 7]:
+        m = square_cycle_mapping(size, size, max_out, offset=offset)
+        dense = m.to_dense()
+        
+        # Each input still connects to max_out outputs
+        assert (dense.sum(dim=0) == max_out).all(), f"Failed for offset={offset}"
+        # Each output still receives max_out inputs
+        assert (dense.sum(dim=1) == max_out).all(), f"Failed for offset={offset}"

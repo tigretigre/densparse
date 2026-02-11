@@ -2,13 +2,18 @@
 from typing import Callable, Tuple
 from densparse.mapping import DenSparseMapping
 
-def up_cycle_mapping(input_size: int, output_size: int, max_out: int) -> DenSparseMapping:
+def up_cycle_mapping(
+    input_size: int, output_size: int, max_out: int, offset: int = 0
+) -> DenSparseMapping:
     """Create a mapping from smaller to larger layer with cyclic connectivity.
     
     Args:
         input_size: Size of input layer
         output_size: Size of output layer (must be multiple of input_size)
         max_out: Maximum outputs per input node
+        offset: Phase shift for the cyclic pattern (default 0). The entire
+            output pattern is shifted by this amount. Positive values shift
+            outputs to higher indices (with wraparound).
         
     Returns:
         DenSparseMapping with cyclic pattern scaled up
@@ -26,8 +31,8 @@ def up_cycle_mapping(input_size: int, output_size: int, max_out: int) -> DenSpar
     
     def mapping_func(input_idx: int, weight_idx: int) -> Tuple[int, bool]:
         base_output = input_idx * ratio
-        offset = weight_idx - (max_in - 1) // 2 * ratio
-        return ((base_output + offset) % output_size, True)
+        local_offset = weight_idx - (max_in - 1) // 2 * ratio
+        return ((base_output + local_offset + offset) % output_size, True)
     
     return DenSparseMapping.from_function(input_size, output_size, width, mapping_func)
 
