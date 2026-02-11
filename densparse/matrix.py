@@ -72,10 +72,11 @@ class DenSparseMatrix(nn.Module):
 
     @forward_weights.setter
     def forward_weights(self, value: torch.Tensor):
-        """Set input-side weights, applying mask."""
+        """Set input-side weights, applying mask and syncing reverse weights."""
         with torch.no_grad():
             self._parameters['_forward_weights_param'].copy_(value)
             self._parameters['_forward_weights_param'] *= self.mapping.input_mask
+            self._update_reverse_weights()
 
     @property
     def reverse_weights(self) -> torch.Tensor:
@@ -260,8 +261,8 @@ class DenSparseMatrix(nn.Module):
         Returns:
             A (output_size, input_size) tensor containing the dense matrix
         """
-        dense = torch.zeros(self.mapping.output_size, self.mapping.input_size)
         matrix = self._parameters['_forward_weights_param'].grad if use_grad else self._parameters['_forward_weights_param']
+        dense = torch.zeros(self.mapping.output_size, self.mapping.input_size, device=matrix.device)
         
         # For each input, find all its unmasked connections and assign values
         for i in range(self.mapping.input_size):
