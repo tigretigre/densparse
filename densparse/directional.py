@@ -180,12 +180,28 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
             
             stacked_indices = torch.stack(stacked_indices)  # (num_src, N, width)
             
+            # Pre-stack masks: (num_src, N, width)
+            stacked_masks = []
+            for m in matrices:
+                if m is not None:
+                    stacked_masks.append(m.mapping.input_mask.to(device))
+                else:
+                    stacked_masks.append(torch.zeros(self._N, width, dtype=torch.bool, device=device))
+            stacked_masks = torch.stack(stacked_masks)
+
+            # Track which src_slices have non-None matrices
+            active_mask = torch.tensor(
+                [m is not None for m in matrices], dtype=torch.bool, device=device
+            )
+
             self._column_data.append({
                 'ds': ds,
                 'width': width,
                 'num_src': num_src,
                 'matrices': matrices,
                 'stacked_indices': stacked_indices,  # Cached!
+                'stacked_masks': stacked_masks,      # Cached!
+                'active_mask': active_mask,           # Which slices are non-None
                 'device': device,
             })
     
@@ -277,15 +293,12 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
             # 1. Source inputs: (num_src, batch, N)
             src_inputs = x_slices[:, :num_src, :].permute(1, 0, 2)
 
-            # 2. Stack weights: (num_src, N, width)
-            stacked_weights = []
-            for src_slice in range(num_src):
-                m = matrices[src_slice]
-                if m is not None:
-                    stacked_weights.append(m.forward_weights)
-                else:
-                    stacked_weights.append(torch.zeros(self._N, width, device=device))
-            stacked_weights = torch.stack(stacked_weights)
+            # 2. Stack weights: (num_src, N, width) — no Python loop
+            stacked_weights = torch.stack([
+                m.forward_weights if m is not None
+                else torch.zeros(self._N, width, device=device)
+                for m in matrices
+            ])
 
             # 3. Cached scatter indices: (num_src, N, width)
             stacked_indices = col_data['stacked_indices']
@@ -300,12 +313,13 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                 indices_expanded.reshape(num_src, batch_size, -1),
                 products.view(num_src, batch_size, -1))
 
-            # 6. Write intermediate to output slices
-            inter_2d = intermediate.permute(1, 0, 2)  # (batch, num_src, N)
-            for src_slice in range(num_src):
-                dst_slice = src_slice + ds
-                s = dst_slice * self._N
-                output[:, s:s + self._N] = output[:, s:s + self._N] + inter_2d[:, src_slice]
+            # 6. Write intermediate to output — contiguous slice, no Python loop
+            # dst slices for this ds are [ds, ds+1, ..., ds+num_src-1]
+            # intermediate is (num_src, batch, N), permute to (batch, num_src*N)
+            inter_flat = intermediate.permute(1, 0, 2).reshape(batch_size, -1)
+            s = ds * self._N
+            e = (ds + num_src) * self._N
+            output[:, s:e] = output[:, s:e] + inter_flat
 
         if was_vector:
             output = output.squeeze(0)
@@ -347,17 +361,24 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
             num_src = col_data['num_src']
             matrices = col_data['matrices']
             indices = col_data['stacked_indices']  # (num_src, N, width)
+            width = col_data['width']
 
-            for src_slice in range(num_src):
-                m = matrices[src_slice]
-                if m is None:
-                    continue
-                dst_slice = src_slice + ds
-                fwd_abs = m.forward_weights.abs()  # (N, width)
-                mapping = indices[src_slice]         # (N, width) — dst_local indices
-                # Scatter abs weights to dst positions
-                incoming_sums[dst_slice].scatter_add_(0,
-                    mapping.reshape(-1), fwd_abs.reshape(-1))
+            # Stack all forward weights for this column: (num_src, N, width)
+            stacked_weights = torch.stack([
+                m.forward_weights if m is not None
+                else torch.zeros(N, width, device=device)
+                for m in matrices
+            ])
+            fwd_abs = stacked_weights.abs()  # (num_src, N, width)
+
+            # Compute per-slice sums via scatter_add, then write to incoming_sums
+            # indices: (num_src, N, width) — local dst indices
+            flat_abs = fwd_abs.reshape(num_src, -1)           # (num_src, N*width)
+            flat_idx = indices.reshape(num_src, -1)           # (num_src, N*width)
+            per_slice_sums = torch.zeros(num_src, N, device=device)
+            per_slice_sums.scatter_add_(1, flat_idx, flat_abs)
+            # dst_slices for this ds column: [ds, ds+1, ..., ds+num_src-1]
+            incoming_sums[ds:ds + num_src] += per_slice_sums
 
         # Step 2: Normalize forward_weights in each matrix
         with torch.no_grad():
@@ -368,21 +389,23 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                 num_src = col_data['num_src']
                 matrices = col_data['matrices']
                 indices = col_data['stacked_indices']
+                stacked_masks = col_data['stacked_masks']
+
+                # Gather norms for all slices at once: (num_src, N, width)
+                # norms[s, i, c] = incoming_sums[s + ds, indices[s, i, c]]
+                dst_sums = incoming_sums[ds:ds + num_src]  # (num_src, N)
+                norms = torch.gather(
+                    dst_sums.unsqueeze(-1).expand(-1, -1, col_data['width']),
+                    1,
+                    indices,
+                ).clamp(min=1e-15)
+
+                divisor = torch.where(stacked_masks, norms, torch.ones_like(norms))
 
                 for src_slice in range(num_src):
                     m = matrices[src_slice]
-                    if m is None:
-                        continue
-                    dst_slice = src_slice + ds
-                    mapping = indices[src_slice]  # (N, width)
-                    mask = m.mapping.input_mask
-
-                    # Gather norms: norms_for_fwd[i, c] = incoming_sums[dst_slice, mapping[i, c]]
-                    norms = incoming_sums[dst_slice][mapping].clamp(min=1e-15)
-
-                    m._parameters['_forward_weights_param'].div_(
-                        torch.where(mask, norms, torch.ones_like(norms))
-                    )
+                    if m is not None:
+                        m._parameters['_forward_weights_param'].div_(divisor[src_slice])
 
             # Forward weights changed → reverse weights stale
             self._reverse_dirty = True
@@ -507,22 +530,22 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
             # Use cached stacked_indices: (num_src, N, width)
             all_indices = col_data['stacked_indices']
 
-            # Per-matrix STDP using compiled kernel
-            for src_slice in range(num_src):
-                m = matrices[src_slice]
-                if m is None:
-                    continue
-                if not (src_spiked[src_slice].any() or dst_spiked[src_slice].any()):
-                    continue
+            # Per-slice STDP with early spike-skip (most slices are inactive)
+            with torch.no_grad():
+                for src_slice in range(num_src):
+                    if not any_active[src_slice]:
+                        continue
+                    m = matrices[src_slice]
+                    if m is None:
+                        continue
 
-                fwd_weights = m.forward_weights     # (N, width)
-                mask = m.mapping.input_mask          # (N, width)
-                indices = all_indices[src_slice]      # (N, width)
+                    fwd_weights = m.forward_weights     # (N, width)
+                    mask = m.mapping.input_mask          # (N, width)
+                    indices = all_indices[src_slice]      # (N, width)
 
-                dst_times_exp = dst_times[src_slice][indices]   # (N, width)
-                src_times_exp = src_times[src_slice].unsqueeze(1)  # (N, 1)
+                    dst_times_exp = dst_times[src_slice][indices]   # (N, width)
+                    src_times_exp = src_times[src_slice].unsqueeze(1)  # (N, 1)
 
-                with torch.no_grad():
                     new_w = _stdp_kernel(
                         fwd_weights, mask, dst_times_exp, src_times_exp,
                         current_time, a_pos, a_neg, tau_pos, tau_neg, eta,
