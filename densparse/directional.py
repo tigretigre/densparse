@@ -16,8 +16,14 @@ def _stdp_kernel(
     tau_pos: float,
     tau_neg: float,
     eta: float,
+    distance_factor: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pure-tensor STDP computation for a single (src_slice, ds) pair.
+
+    Args:
+        distance_factor: Optional (N, width) tensor with per-connection
+            distance modulation (e.g. 1/sqrt(dist)). If None, all
+            connections have equal learning rate.
 
     Returns updated forward_weights.
     """
@@ -41,6 +47,9 @@ def _stdp_kernel(
             torch.zeros_like(dt_float),
         ),
     ) * dt_float * eta
+
+    if distance_factor is not None:
+        dw = dw * distance_factor
 
     new_w = (fwd_weights + dw * needs_update).clamp(0.0, 1.0)
     return torch.where(mask, new_w, fwd_weights)
@@ -94,6 +103,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         self._D = D
         self._matrices_2d = matrices
         self._reverse_dirty = False
+        self._distance_factors = None  # Optional per-matrix distance modulation
 
         # Compute widths for each ds column
         self._widths = self._compute_widths()
@@ -546,9 +556,15 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                     dst_times_exp = dst_times[src_slice][indices]   # (N, width)
                     src_times_exp = src_times[src_slice].unsqueeze(1)  # (N, 1)
 
+                    # Distance modulation (if set)
+                    dist_factor = None
+                    if self._distance_factors is not None:
+                        dist_factor = self._distance_factors[src_slice][ds]
+
                     new_w = _stdp_kernel(
                         fwd_weights, mask, dst_times_exp, src_times_exp,
                         current_time, a_pos, a_neg, tau_pos, tau_neg, eta,
+                        distance_factor=dist_factor,
                     )
                     m._parameters['_forward_weights_param'].copy_(new_w)
 
@@ -609,10 +625,29 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         
         return regrown
 
+    def set_distance_factors(
+        self,
+        factors: List[List[Optional[torch.Tensor]]],
+    ) -> None:
+        """Set per-connection distance modulation factors.
+
+        Args:
+            factors: 2D list matching matrices_2d layout. Each entry is
+                either a (N, width) tensor or None. Values are multiplied
+                into the STDP weight change (e.g. 1/sqrt(dist)).
+        """
+        self._distance_factors = factors
+
     def to(self, device: torch.device) -> 'DirectionalRangeCompositeMapping':
         """Move all matrices to device and rebuild cached column indices."""
         super().to(device)
         self._build_column_scatter_indices()
+        # Move distance factors if present
+        if self._distance_factors is not None:
+            for row in self._distance_factors:
+                for i, f in enumerate(row):
+                    if f is not None:
+                        row[i] = f.to(device)
         return self
 
     def get_column_weights(self, ds: int) -> List[torch.Tensor]:
