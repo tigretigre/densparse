@@ -59,12 +59,23 @@ def _stdp_kernel(
     return torch.where(mask, new_w, fwd_weights)
 
 
-# Try to compile the STDP kernel. Falls back to eager if inductor fails
-# (e.g., architecture mismatch on Apple Silicon with some PyTorch builds).
-try:
-    _stdp_kernel_compiled = torch.compile(_stdp_kernel, mode="reduce-overhead")
-except Exception:
-    _stdp_kernel_compiled = _stdp_kernel
+# Try to compile the STDP kernel. Falls back to eager if inductor fails.
+# Note: torch.compile() itself rarely raises; errors surface on first call.
+# We warm-test with a small tensor to surface compilation failures eagerly.
+def _try_compile_stdp_kernel():
+    try:
+        compiled = torch.compile(_stdp_kernel, mode="reduce-overhead")
+        # Trigger compilation now; catches broken inductor backends
+        _N = 4
+        w = torch.zeros(_N, 2)
+        m = torch.zeros(_N, 2, dtype=torch.bool)
+        t = torch.zeros(_N, 2, dtype=torch.long)
+        compiled(w, m, t, t, 1, 1.0, 0.75, 1.0, 1.0, 0.1)
+        return compiled
+    except Exception:
+        return _stdp_kernel
+
+_stdp_kernel_compiled = _try_compile_stdp_kernel()
 
 
 class DirectionalRangeCompositeMapping(CompositeMapping):
@@ -577,54 +588,101 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         self._reverse_dirty = True
 
     def prune_incoming(self, keep: int) -> None:
-        """Keep top-k incoming weights per destination.
+        """Keep top-k incoming weights per destination neuron.
 
-        Uses reverse_weights to gather all weights arriving at each destination
-        neuron, zeros out those outside the top-k, and syncs forward weights.
+        Vectorized implementation using torch.topk — eliminates the O(S*N)
+        Python loop that dominates at large network sizes (54% of total time
+        at 128x128 with naive per-neuron Python iteration).
+
+        For each destination slice, gathers all reverse-weight tensors from
+        contributing source slices into a single (N, total_incoming) matrix,
+        applies topk masking in one call, then scatters the zero-mask back to
+        individual matrices' forward and reverse weight parameters.
 
         Args:
-            keep: Number of connections to keep per destination
+            keep: Number of incoming connections to keep per destination.
         """
         self._sync_reverse_weights()
         N, S, D = self._N, self._S, self._D
 
-        for dst_slice in range(S):
-            matrices_info = []
-            for ds in range(min(D + 1, dst_slice + 1)):
-                src_slice = dst_slice - ds
-                if src_slice < 0:
-                    continue
-                if ds >= len(self._matrices_2d[src_slice]):
-                    continue
-                m = self._matrices_2d[src_slice][ds]
-                if m is not None:
-                    matrices_info.append((m, src_slice, ds))
+        with torch.no_grad():
+            for dst_slice in range(S):
+                # Collect matrices contributing to this destination slice
+                matrices_info = []
+                for ds in range(min(D + 1, dst_slice + 1)):
+                    src_slice = dst_slice - ds
+                    if src_slice < 0:
+                        continue
+                    if ds >= len(self._matrices_2d[src_slice]):
+                        continue
+                    m = self._matrices_2d[src_slice][ds]
+                    if m is not None:
+                        matrices_info.append((m, src_slice, ds))
 
-            if not matrices_info:
-                continue
-
-            for dst_local in range(N):
-                weight_list = []
-                for mat_idx, (m, _, _) in enumerate(matrices_info):
-                    rev_w = m.reverse_weights[dst_local, :]
-                    mask = m.mapping.output_mask[dst_local, :]
-                    for col in range(rev_w.shape[0]):
-                        if mask[col] and rev_w[col].abs().item() > 1e-15:
-                            weight_list.append((rev_w[col].abs().item(), mat_idx, col))
-
-                if len(weight_list) <= keep:
+                if not matrices_info:
                     continue
 
-                weight_list.sort(reverse=True, key=lambda x: x[0])
-                to_zero = weight_list[keep:]
-                for _, mat_idx, col in to_zero:
-                    m, src_slice, ds = matrices_info[mat_idx]
-                    with torch.no_grad():
-                        m._parameters['_reverse_weights_param'][dst_local, col] = 0.0
-                        out_map = m.mapping.output_mapping[dst_local, col].item()
-                        m._parameters['_forward_weights_param'][out_map, col] = 0.0
+                # ── Vectorized topk over all incoming connections ─────────
+                # Build (N, total_incoming) view of all reverse weights and masks
 
-        # Packed weights are now stale (prune modified matrix params)
+                rev_chunks = []   # list of (N, w_i) reverse-weight tensors
+                mask_chunks = []  # list of (N, w_i) bool mask tensors
+
+                for m, _, _ in matrices_info:
+                    rev_chunks.append(m._parameters['_reverse_weights_param'])
+                    mask_chunks.append(m.mapping.output_mask)
+
+                all_weights = torch.cat(rev_chunks, dim=1)   # (N, total_incoming)
+                all_masks   = torch.cat(mask_chunks, dim=1)  # (N, total_incoming)
+                total_incoming = all_weights.shape[1]
+
+                if keep >= total_incoming:
+                    continue
+
+                # Which neurons have more than `keep` active incoming connections?
+                active_count = (all_masks & (all_weights.abs() > 1e-15)).sum(dim=1)
+                has_excess = active_count > keep
+                if not has_excess.any():
+                    continue
+
+                # Absolute weights for active connections (inactive → 0)
+                abs_w = all_weights.abs() * all_masks
+
+                # topk returns top-`keep` indices per row
+                actual_k = min(keep, total_incoming)
+                _, top_idx = abs_w.topk(actual_k, dim=1, largest=True)
+
+                # Build keep-mask: scatter True at top-k positions
+                keep_mask = torch.zeros(N, total_incoming,
+                                        dtype=torch.bool, device=abs_w.device)
+                keep_mask.scatter_(1, top_idx, True)
+
+                # to_zero: active connections NOT in top-k, for neurons with excess
+                to_zero = (all_masks & ~keep_mask) & has_excess.unsqueeze(1)
+
+                if not to_zero.any():
+                    continue
+
+                # ── Scatter zeros back to per-matrix parameters ───────────
+                offset = 0
+                for m, _, _ in matrices_info:
+                    w = m._parameters['_reverse_weights_param'].shape[1]
+                    z = to_zero[:, offset:offset + w]  # (N, w) slice
+                    offset += w
+
+                    if not z.any():
+                        continue
+
+                    # Zero reverse weights
+                    m._parameters['_reverse_weights_param'][z] = 0.0
+
+                    # Zero corresponding forward weights:
+                    # output_mapping[dst_local, col] = src_local for that connection
+                    z_rows, z_cols = z.nonzero(as_tuple=True)
+                    src_locals = m.mapping.output_mapping[z_rows, z_cols]
+                    m._parameters['_forward_weights_param'][src_locals, z_cols] = 0.0
+
+        # Forward weights stale — rebuild packed cache before next forward
         self._weights_dirty = True
 
     def grow_connections(self, rate: float, init_weight: float = 0.01) -> int:
