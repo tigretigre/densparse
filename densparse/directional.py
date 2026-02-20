@@ -18,16 +18,20 @@ def _stdp_kernel(
     eta: float,
     distance_factor: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Pure-tensor STDP computation for a single (src_slice, ds) pair.
+    """Pure-tensor STDP computation. Handles any leading batch dimensions.
 
     Args:
-        distance_factor: Optional (N, width) tensor with per-connection
-            distance modulation (e.g. 1/sqrt(dist)). If None, all
-            connections have equal learning rate.
+        fwd_weights:   (..., N, width) — current weights
+        mask:          (..., N, width) — valid connections
+        dst_times_exp: (..., N, width) — last spike time of dst, expanded to width
+        src_times_exp: (..., N, 1) or (..., N, width) — last spike time of src
+        current_time:  scalar current timestep
+        distance_factor: Optional (..., N, width) per-connection modulation.
 
-    Returns updated forward_weights.
+    Returns:
+        Updated forward_weights of same shape.
     """
-    dt = dst_times_exp - src_times_exp  # (N, width)
+    dt = dst_times_exp - src_times_exp  # (..., N, width)
 
     dst_just_spiked = (dst_times_exp == current_time)
     src_just_spiked = (src_times_exp == current_time)
@@ -58,25 +62,28 @@ def _stdp_kernel(
 # Try to compile the STDP kernel. Falls back to eager if inductor fails
 # (e.g., architecture mismatch on Apple Silicon with some PyTorch builds).
 try:
-    _stdp_kernel_compiled = torch.compile(_stdp_kernel)
+    _stdp_kernel_compiled = torch.compile(_stdp_kernel, mode="reduce-overhead")
 except Exception:
     _stdp_kernel_compiled = _stdp_kernel
 
 
 class DirectionalRangeCompositeMapping(CompositeMapping):
     """Optimized composite mapping for directional range-limited connectivity.
-    
+
     This class is designed for cylinder-like structures where:
     - Neurons are organized in S slices of N neurons each
     - Connections go from slice s to slices s, s+1, ..., s+D
     - Each connection pattern within a slice is cyclic
-    
-    The class exploits the regular structure for efficient operations:
-    - Column-wise scatter index sharing (even/odd ds parity optimization)
-    - Packed weight tensors per ds column (no width padding)
-    - Vectorized normalize and prune operations
+
+    Key optimizations:
+    - Packed weight cache: pre-allocated (num_src, N, width) buffers per ds
+      column; avoids torch.stack allocation on every forward/STDP call.
+    - Fully batched STDP: all src_slices in a column computed in one kernel
+      call — no Python loop over slices.
+    - compiled _stdp_kernel: uses torch.compile(mode="reduce-overhead").
+    - CUDA graph capture helpers for zero-overhead iteration loops.
     """
-    
+
     def __init__(
         self,
         matrices: List[List[Optional[DenSparseMatrix]]],
@@ -85,7 +92,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         D: int,
     ):
         """Initialize with 2D list of matrices.
-        
+
         Args:
             matrices: 2D list where matrices[src_slice][ds] is the DenSparseMatrix
                 for connections from src_slice to (src_slice + ds), or None if
@@ -97,7 +104,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         # Flatten non-None matrices for base class
         flat = [m for row in matrices for m in row if m is not None]
         super().__init__(flat)
-        
+
         self._N = N
         self._S = S
         self._D = D
@@ -105,12 +112,19 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         self._reverse_dirty = False
         self._distance_factors = None  # Optional per-matrix distance modulation
 
+        # Packed weight cache: per-column (num_src, N, width) tensor.
+        # Rebuilt lazily when _weights_dirty = True.
+        self._packed_weights: List[Optional[torch.Tensor]] = []
+        self._weights_dirty = True  # Force initial build
+
         # Compute widths for each ds column
         self._widths = self._compute_widths()
 
         # Pre-build column-wise scatter indices
         self._build_column_scatter_indices()
-    
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+
     def _sync_reverse_weights(self) -> None:
         """Sync reverse weights from forward weights for all dirty matrices.
 
@@ -128,7 +142,6 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         """Compute mapping width for each ds column."""
         widths = []
         for ds in range(self._D + 1):
-            # Find first non-None matrix in this column
             width = 0
             for src_slice in range(self._S):
                 if ds < len(self._matrices_2d[src_slice]):
@@ -138,22 +151,25 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                         break
             widths.append(width)
         return widths
-    
+
     def _build_column_scatter_indices(self):
-        """Pre-compute column metadata and cache indices for batched forward pass.
-        
-        For each ds column, pre-stacks indices and prepares for fast forward pass.
+        """Pre-compute column metadata and cache indices for batched operations.
+
+        For each ds column, pre-stacks indices/masks and allocates packed
+        weight buffers used by forward, STDP, and normalize.
         """
         self._column_data = []
-        
+        self._packed_weights = []
+
         for ds in range(self._D + 1):
             width = self._widths[ds]
             num_src = self._S - ds
-            
+
             if width == 0 or num_src == 0:
                 self._column_data.append(None)
+                self._packed_weights.append(None)
                 continue
-            
+
             # Collect matrices for this column
             matrices = []
             for src_slice in range(num_src):
@@ -162,72 +178,89 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                     matrices.append(m)
                 else:
                     matrices.append(None)
-            
-            # Check if we have any non-None matrices
+
             if all(m is None for m in matrices):
                 self._column_data.append(None)
+                self._packed_weights.append(None)
                 continue
-            
-            # Pre-compute and cache indices (they don't change)
-            # Get device from first non-None matrix
+
+            # Infer device from first non-None matrix
             device = None
             for m in matrices:
                 if m is not None:
                     device = m.forward_weights.device
                     break
-            
             if device is None:
                 self._column_data.append(None)
+                self._packed_weights.append(None)
                 continue
-            
-            # Pre-stack indices: (num_src, N, width)
-            stacked_indices = []
-            for m in matrices:
-                if m is not None:
-                    stacked_indices.append(m.mapping.input_mapping.to(device))
-                else:
-                    stacked_indices.append(torch.zeros(self._N, width, dtype=torch.long, device=device))
-            
-            stacked_indices = torch.stack(stacked_indices)  # (num_src, N, width)
-            
-            # Pre-stack masks: (num_src, N, width)
-            stacked_masks = []
-            for m in matrices:
-                if m is not None:
-                    stacked_masks.append(m.mapping.input_mask.to(device))
-                else:
-                    stacked_masks.append(torch.zeros(self._N, width, dtype=torch.bool, device=device))
-            stacked_masks = torch.stack(stacked_masks)
 
-            # Track which src_slices have non-None matrices
+            # Pre-stack indices: (num_src, N, width)
+            stacked_indices = torch.stack([
+                m.mapping.input_mapping.to(device) if m is not None
+                else torch.zeros(self._N, width, dtype=torch.long, device=device)
+                for m in matrices
+            ])
+
+            # Pre-stack masks: (num_src, N, width)
+            stacked_masks = torch.stack([
+                m.mapping.input_mask.to(device) if m is not None
+                else torch.zeros(self._N, width, dtype=torch.bool, device=device)
+                for m in matrices
+            ])
+
+            # Which src_slices have non-None matrices
             active_mask = torch.tensor(
                 [m is not None for m in matrices], dtype=torch.bool, device=device
             )
+
+            # Packed weight buffer: (num_src, N, width) — filled lazily
+            packed_w = torch.zeros(num_src, self._N, width, device=device)
 
             self._column_data.append({
                 'ds': ds,
                 'width': width,
                 'num_src': num_src,
                 'matrices': matrices,
-                'stacked_indices': stacked_indices,  # Cached!
-                'stacked_masks': stacked_masks,      # Cached!
-                'active_mask': active_mask,           # Which slices are non-None
+                'stacked_indices': stacked_indices,
+                'stacked_masks': stacked_masks,
+                'active_mask': active_mask,
                 'device': device,
             })
-    
-    def to_dense(self) -> torch.Tensor:
-        """Convert to a dense (S*N, S*N) matrix representation.
+            self._packed_weights.append(packed_w)
 
-        Places each per-slice matrix at the appropriate block position
-        based on src_slice and dst_slice.
+        # Force initial pack
+        self._weights_dirty = True
 
-        Returns:
-            A (S*N, S*N) tensor containing the full dense matrix
+    def _rebuild_packed_weights(self) -> None:
+        """Rebuild packed weight buffers from individual matrix parameters.
+
+        Called before forward pass if _weights_dirty is True.
+        Each column gets a (num_src, N, width) tensor with stacked weights.
         """
+        for ds, col_data in enumerate(self._column_data):
+            if col_data is None:
+                continue
+            pw = self._packed_weights[ds]
+            if pw is None:
+                continue
+            matrices = col_data['matrices']
+            width = col_data['width']
+            device = col_data['device']
+            for s, m in enumerate(matrices):
+                if m is not None:
+                    pw[s].copy_(m.forward_weights)
+                else:
+                    pw[s].zero_()
+        self._weights_dirty = False
+
+    # ── Forward pass ─────────────────────────────────────────────────────
+
+    def to_dense(self) -> torch.Tensor:
+        """Convert to a dense (S*N, S*N) matrix representation."""
         self._sync_reverse_weights()
         total = self._S * self._N
-        
-        # Get device from first non-None matrix
+
         device = None
         for row in self._matrices_2d:
             for m in row:
@@ -236,43 +269,32 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                     break
             if device is not None:
                 break
-        
         if device is None:
             device = torch.device('cpu')
-        
+
         result = torch.zeros(total, total, device=device)
-        
+
         for src_slice in range(self._S):
             for ds in range(len(self._matrices_2d[src_slice])):
                 m = self._matrices_2d[src_slice][ds]
                 if m is None:
                     continue
-                
                 dst_slice = src_slice + ds
                 if dst_slice >= self._S:
                     continue
-                
-                # Get dense block for this matrix
-                block = m.to_dense()  # (N, N)
-                
-                # Place at (dst_slice, src_slice) block position
-                # Note: dense matrix is (output, input) = (dst, src)
+                block = m.to_dense()
                 dst_start = dst_slice * self._N
-                dst_end = dst_start + self._N
                 src_start = src_slice * self._N
-                src_end = src_start + self._N
-                
-                result[dst_start:dst_end, src_start:src_end] = block
-        
-        return result
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Mega-matrix forward pass.
+                result[dst_start:dst_start + self._N,
+                       src_start:src_start + self._N] = block
 
-        For each ds column, batch-processes all src_slices:
-        1. Stack source inputs and weights
-        2. Multiply and scatter-add to intermediate
-        3. Scatter-add intermediate to output using pre-computed indices
+        return result
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Batched forward pass using pre-packed weight tensors.
+
+        Rebuilds the packed weight cache if weights were modified since the
+        last forward call, then processes all ds columns in a vectorized loop.
 
         Args:
             x: Input tensor of shape (S*N,) or (batch, S*N)
@@ -280,6 +302,9 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         Returns:
             Output tensor of same shape
         """
+        if self._weights_dirty:
+            self._rebuild_packed_weights()
+
         was_vector = x.dim() == 1
         if was_vector:
             x = x.unsqueeze(0)
@@ -298,34 +323,26 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
 
             num_src = col_data['num_src']
             width = col_data['width']
-            matrices = col_data['matrices']
 
-            # 1. Source inputs: (num_src, batch, N)
-            src_inputs = x_slices[:, :num_src, :].permute(1, 0, 2)
-
-            # 2. Stack weights: (num_src, N, width) — no Python loop
-            stacked_weights = torch.stack([
-                m.forward_weights if m is not None
-                else torch.zeros(self._N, width, device=device)
-                for m in matrices
-            ])
-
-            # 3. Cached scatter indices: (num_src, N, width)
+            # (num_src, N, width) — from cache, no allocation
+            stacked_weights = self._packed_weights[ds]
+            # (num_src, N, width) — pre-computed indices
             stacked_indices = col_data['stacked_indices']
 
-            # 4. Multiply: (num_src, batch, N, width)
+            # Source inputs: (num_src, batch, N)
+            src_inputs = x_slices[:, :num_src, :].permute(1, 0, 2)
+
+            # Multiply: (num_src, batch, N, width)
             products = src_inputs.unsqueeze(-1) * stacked_weights.unsqueeze(1)
 
-            # 5. Scatter-add to per-src intermediate: (num_src, batch, N)
+            # Scatter-add to per-src intermediate: (num_src, batch, N)
             indices_expanded = stacked_indices.unsqueeze(1).expand(-1, batch_size, -1, -1)
             intermediate = torch.zeros(num_src, batch_size, self._N, device=device)
             intermediate.scatter_add_(2,
                 indices_expanded.reshape(num_src, batch_size, -1),
                 products.view(num_src, batch_size, -1))
 
-            # 6. Write intermediate to output — contiguous slice, no Python loop
-            # dst slices for this ds are [ds, ds+1, ..., ds+num_src-1]
-            # intermediate is (num_src, batch, N), permute to (batch, num_src*N)
+            # Write to output: dst slices are [ds, ds+1, ..., ds+num_src-1]
             inter_flat = intermediate.permute(1, 0, 2).reshape(batch_size, -1)
             s = ds * self._N
             e = (ds + num_src) * self._N
@@ -335,154 +352,9 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
             output = output.squeeze(0)
 
         return output
-    
-    def normalize_incoming(self) -> None:
-        """L1-normalize incoming weights per destination across all matrices.
 
-        For each destination neuron, sum all incoming weights from all
-        source slices and normalize so they sum to 1.
+    # ── STDP ─────────────────────────────────────────────────────────────
 
-        Computes sums directly from forward_weights using scatter_add,
-        avoiding the expensive reverse weight sync entirely.
-        """
-        N, S, D = self._N, self._S, self._D
-
-        # Get device from first non-None matrix
-        device = None
-        for row in self._matrices_2d:
-            for m in row:
-                if m is not None:
-                    device = m.forward_weights.device
-                    break
-            if device is not None:
-                break
-        if device is None:
-            return
-
-        # Step 1: Compute sum of |incoming weights| per destination using forward_weights.
-        # forward_weights[src_local, col] has dst = input_mapping[src_local, col].
-        # We scatter_add abs(forward_weights) by destination to get per-dst sums.
-        incoming_sums = torch.zeros(S, N, device=device)
-
-        for ds in range(D + 1):
-            col_data = self._column_data[ds]
-            if col_data is None:
-                continue
-            num_src = col_data['num_src']
-            matrices = col_data['matrices']
-            indices = col_data['stacked_indices']  # (num_src, N, width)
-            width = col_data['width']
-
-            # Stack all forward weights for this column: (num_src, N, width)
-            stacked_weights = torch.stack([
-                m.forward_weights if m is not None
-                else torch.zeros(N, width, device=device)
-                for m in matrices
-            ])
-            fwd_abs = stacked_weights.abs()  # (num_src, N, width)
-
-            # Compute per-slice sums via scatter_add, then write to incoming_sums
-            # indices: (num_src, N, width) — local dst indices
-            flat_abs = fwd_abs.reshape(num_src, -1)           # (num_src, N*width)
-            flat_idx = indices.reshape(num_src, -1)           # (num_src, N*width)
-            per_slice_sums = torch.zeros(num_src, N, device=device)
-            per_slice_sums.scatter_add_(1, flat_idx, flat_abs)
-            # dst_slices for this ds column: [ds, ds+1, ..., ds+num_src-1]
-            incoming_sums[ds:ds + num_src] += per_slice_sums
-
-        # Step 2: Normalize forward_weights in each matrix
-        with torch.no_grad():
-            for ds in range(D + 1):
-                col_data = self._column_data[ds]
-                if col_data is None:
-                    continue
-                num_src = col_data['num_src']
-                matrices = col_data['matrices']
-                indices = col_data['stacked_indices']
-                stacked_masks = col_data['stacked_masks']
-
-                # Gather norms for all slices at once: (num_src, N, width)
-                # norms[s, i, c] = incoming_sums[s + ds, indices[s, i, c]]
-                dst_sums = incoming_sums[ds:ds + num_src]  # (num_src, N)
-                norms = torch.gather(
-                    dst_sums.unsqueeze(-1).expand(-1, -1, col_data['width']),
-                    1,
-                    indices,
-                ).clamp(min=1e-15)
-
-                divisor = torch.where(stacked_masks, norms, torch.ones_like(norms))
-
-                for src_slice in range(num_src):
-                    m = matrices[src_slice]
-                    if m is not None:
-                        m._parameters['_forward_weights_param'].div_(divisor[src_slice])
-
-            # Forward weights changed → reverse weights stale
-            self._reverse_dirty = True
-    
-    def prune_incoming(self, keep: int) -> None:
-        """Keep top-k incoming weights per destination.
-
-        Uses vectorized operations: for each destination, gathers all incoming
-        weights from reverse_weights tensors, finds top-k, and creates masks
-        to zero out the rest.
-
-        Args:
-            keep: Number of connections to keep per destination
-        """
-        self._sync_reverse_weights()
-        N, S, D = self._N, self._S, self._D
-        
-        # Process each destination slice
-        for dst_slice in range(S):
-            # Collect all matrices contributing to this slice and their weights
-            # Each matrix's reverse_weights[:, :] gives weights TO each local dst
-            matrices_info = []  # List of (matrix, src_slice, ds)
-            
-            for ds in range(min(D + 1, dst_slice + 1)):
-                src_slice = dst_slice - ds
-                if src_slice < 0:
-                    continue
-                if ds >= len(self._matrices_2d[src_slice]):
-                    continue
-                m = self._matrices_2d[src_slice][ds]
-                if m is not None:
-                    matrices_info.append((m, src_slice, ds))
-            
-            if not matrices_info:
-                continue
-            
-            # For each local destination, gather weights and find top-k
-            for dst_local in range(N):
-                # Collect all weights to this destination
-                weight_list = []  # (abs_weight, matrix_idx, col_idx)
-                
-                for mat_idx, (m, _, _) in enumerate(matrices_info):
-                    # reverse_weights[dst_local, :] = weights TO dst_local
-                    rev_w = m.reverse_weights[dst_local, :]  # (width,)
-                    mask = m.mapping.output_mask[dst_local, :]  # (width,)
-                    
-                    for col in range(rev_w.shape[0]):
-                        if mask[col] and rev_w[col].abs().item() > 1e-15:
-                            weight_list.append((rev_w[col].abs().item(), mat_idx, col))
-                
-                if len(weight_list) <= keep:
-                    continue
-                
-                # Sort by absolute weight, descending
-                weight_list.sort(reverse=True, key=lambda x: x[0])
-                
-                # Zero out weights not in top-k
-                to_zero = weight_list[keep:]
-                for _, mat_idx, col in to_zero:
-                    m, src_slice, ds = matrices_info[mat_idx]
-                    with torch.no_grad():
-                        m._parameters['_reverse_weights_param'][dst_local, col] = 0.0
-                        # Also zero forward_weights at corresponding location
-                        # Find which input maps to this (dst_local, col)
-                        out_map = m.mapping.output_mapping[dst_local, col].item()
-                        m._parameters['_forward_weights_param'][out_map, col] = 0.0
-    
     def stdp_update(
         self,
         spiked: torch.Tensor,
@@ -494,135 +366,310 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         tau_neg: float = 1.0,
         eta: float = 0.1,
     ) -> None:
-        """Column-batched STDP weight update.
+        """Device-adaptive STDP weight update.
 
-        For each ds column, stacks all src_slices' weights, mappings, and
-        spike times into single tensors and computes the STDP update in one
-        vectorized pass — eliminating the inner Python loop over src_slices.
+        **GPU/accelerator path** (device != CPU):
+            All src_slices in each ds column are processed in a single batched
+            _stdp_kernel call on (num_src, N, width) tensors. Eliminates
+            per-slice Python-dispatched kernel launches — dominant GPU cost.
+
+        **CPU path**:
+            Per-slice loop with early spike-skip. On CPU, spike trains are
+            sparse (only a few slices active per timestep), so skipping idle
+            slices outweighs the Python loop overhead.
 
         Args:
-            spiked: Boolean tensor (S*N,) indicating which neurons spiked
-            last_spike_time: Tensor (S*N,) with last spike time per neuron
-            current_time: Current timestep
-            a_pos: Potentiation amplitude
-            a_neg: Depression amplitude
-            tau_pos: Potentiation time constant
-            tau_neg: Depression time constant
-            eta: Base learning rate
+            spiked:          Boolean tensor (S*N,) — which neurons spiked now
+            last_spike_time: Tensor (S*N,) — last spike time per neuron
+            current_time:    Current timestep
         """
         N, S, D = self._N, self._S, self._D
         device = spiked.device
+        is_gpu = device.type != "cpu"
 
-        # Reshape to (S, N)
         spiked_2d = spiked.view(S, N)
         last_spike_2d = last_spike_time.view(S, N)
+
+        with torch.no_grad():
+            for ds in range(D + 1):
+                col_data = self._column_data[ds]
+                if col_data is None:
+                    continue
+
+                num_src = col_data['num_src']
+                width = col_data['width']
+                matrices = col_data['matrices']
+                active_mask = col_data['active_mask']  # (num_src,)
+                stacked_masks = col_data['stacked_masks']  # (num_src, N, width)
+                all_indices = col_data['stacked_indices']  # (num_src, N, width)
+
+                src_spiked = spiked_2d[:num_src]        # (num_src, N)
+                dst_spiked = spiked_2d[ds:ds + num_src] # (num_src, N)
+
+                # Quick skip: no spikes anywhere in this column
+                any_active = src_spiked.any(dim=1) | dst_spiked.any(dim=1)
+                if not any_active.any():
+                    continue
+
+                if is_gpu:
+                    # ── GPU path: fully batched across all src_slices ────
+                    # Single kernel call over (num_src, N, width).
+                    # Inactive slices are masked out rather than skipped.
+
+                    # src_times_batch: (num_src, N, 1) → broadcasts
+                    src_times_batch = last_spike_2d[:num_src].unsqueeze(2)
+
+                    # dst_times_batch[s, i, c] = last_spike_2d[s+ds, indices[s, i, c]]
+                    dst_slice_times = last_spike_2d[ds:ds + num_src]
+                    dst_times_batch = torch.gather(
+                        dst_slice_times.unsqueeze(2).expand(-1, -1, width),
+                        1,
+                        all_indices,
+                    )  # (num_src, N, width)
+
+                    # Mask out inactive slices
+                    slice_active = any_active.view(num_src, 1, 1)
+                    effective_mask = stacked_masks & slice_active
+
+                    # Distance modulation
+                    dist_factors = None
+                    if self._distance_factors is not None:
+                        dist_list = [
+                            self._distance_factors[s][ds]
+                            if (s < len(self._distance_factors) and
+                                ds < len(self._distance_factors[s]) and
+                                self._distance_factors[s][ds] is not None)
+                            else torch.zeros(N, width, device=device)
+                            for s in range(num_src)
+                        ]
+                        dist_factors = torch.stack(dist_list)
+
+                    packed_w = self._packed_weights[ds]
+                    new_weights = _stdp_kernel_compiled(
+                        packed_w, effective_mask,
+                        dst_times_batch, src_times_batch,
+                        current_time, a_pos, a_neg, tau_pos, tau_neg, eta,
+                        distance_factor=dist_factors,
+                    )  # (num_src, N, width)
+
+                    # Write back and sync packed cache
+                    for s, m in enumerate(matrices):
+                        if m is not None and active_mask[s]:
+                            m._parameters['_forward_weights_param'].copy_(new_weights[s])
+                    packed_w.copy_(new_weights)
+
+                else:
+                    # ── CPU path: per-slice with early spike-skip ────────
+                    # Sparse activity means most slices are idle; skip them.
+                    for src_slice in range(num_src):
+                        if not any_active[src_slice]:
+                            continue
+                        m = matrices[src_slice]
+                        if m is None:
+                            continue
+
+                        fwd_weights = m.forward_weights      # (N, width)
+                        mask = m.mapping.input_mask           # (N, width)
+                        indices = all_indices[src_slice]      # (N, width)
+
+                        dst_times_exp = last_spike_2d[src_slice + ds][indices]
+                        src_times_exp = last_spike_2d[src_slice].unsqueeze(1)
+
+                        dist_factor = None
+                        if self._distance_factors is not None:
+                            if (src_slice < len(self._distance_factors) and
+                                    ds < len(self._distance_factors[src_slice])):
+                                dist_factor = self._distance_factors[src_slice][ds]
+
+                        new_w = _stdp_kernel_compiled(
+                            fwd_weights, mask, dst_times_exp, src_times_exp,
+                            current_time, a_pos, a_neg, tau_pos, tau_neg, eta,
+                            distance_factor=dist_factor,
+                        )
+                        m._parameters['_forward_weights_param'].copy_(new_w)
+
+                        # Keep packed cache in sync for this slice
+                        pw = self._packed_weights[ds]
+                        if pw is not None:
+                            pw[src_slice].copy_(new_w)
+
+        # Packed weights are up to date; clean for forward
+        self._weights_dirty = False
+        # Reverse weights are stale; sync lazily before normalize/prune
+        self._reverse_dirty = True
+
+    # ── Weight management ─────────────────────────────────────────────────
+
+    def normalize_incoming(self) -> None:
+        """L1-normalize incoming weights per destination across all matrices.
+
+        Vectorized: accumulates sums via scatter_add on packed weight cache,
+        then divides in-place. No Python loop over individual neurons.
+        """
+        N, S, D = self._N, self._S, self._D
+
+        device = None
+        for row in self._matrices_2d:
+            for m in row:
+                if m is not None:
+                    device = m.forward_weights.device
+                    break
+            if device is not None:
+                break
+        if device is None:
+            return
+
+        # Ensure packed weights are current
+        if self._weights_dirty:
+            self._rebuild_packed_weights()
+
+        # Step 1: compute sum of |incoming weights| per dst neuron
+        incoming_sums = torch.zeros(S, N, device=device)
 
         for ds in range(D + 1):
             col_data = self._column_data[ds]
             if col_data is None:
                 continue
-
             num_src = col_data['num_src']
+            indices = col_data['stacked_indices']  # (num_src, N, width)
             width = col_data['width']
-            matrices = col_data['matrices']
 
-            # Source spike times: (num_src, N) — sliced directly
-            src_times = last_spike_2d[:num_src]
-            dst_times = last_spike_2d[ds:ds + num_src]
-            src_spiked = spiked_2d[:num_src]
-            dst_spiked = spiked_2d[ds:ds + num_src]
+            stacked_weights = self._packed_weights[ds]  # (num_src, N, width)
+            fwd_abs = stacked_weights.abs()
 
-            # Quick skip: if no spikes in any src or dst slice for this column
-            any_active = src_spiked.any(dim=1) | dst_spiked.any(dim=1)  # (num_src,)
-            if not any_active.any():
+            flat_abs = fwd_abs.reshape(num_src, -1)        # (num_src, N*width)
+            flat_idx = indices.reshape(num_src, -1)        # (num_src, N*width)
+            per_slice_sums = torch.zeros(num_src, N, device=device)
+            per_slice_sums.scatter_add_(1, flat_idx, flat_abs)
+            incoming_sums[ds:ds + num_src] += per_slice_sums
+
+        # Step 2: divide each weight by its destination's incoming sum
+        with torch.no_grad():
+            for ds in range(D + 1):
+                col_data = self._column_data[ds]
+                if col_data is None:
+                    continue
+                num_src = col_data['num_src']
+                matrices = col_data['matrices']
+                indices = col_data['stacked_indices']  # (num_src, N, width)
+                stacked_masks = col_data['stacked_masks']
+
+                dst_sums = incoming_sums[ds:ds + num_src]  # (num_src, N)
+                # norms[s, i, c] = incoming_sums[s+ds, indices[s, i, c]]
+                norms = torch.gather(
+                    dst_sums.unsqueeze(-1).expand(-1, -1, col_data['width']),
+                    1,
+                    indices,
+                ).clamp(min=1e-15)
+                divisor = torch.where(stacked_masks, norms, torch.ones_like(norms))
+
+                # Update packed cache in-place
+                pw = self._packed_weights[ds]
+                pw.div_(divisor)
+
+                # Write back to matrix parameters
+                for src_slice, m in enumerate(matrices):
+                    if m is not None:
+                        m._parameters['_forward_weights_param'].copy_(pw[src_slice])
+
+        # Packed weights just updated; mark clean for forward
+        self._weights_dirty = False
+        self._reverse_dirty = True
+
+    def prune_incoming(self, keep: int) -> None:
+        """Keep top-k incoming weights per destination.
+
+        Uses reverse_weights to gather all weights arriving at each destination
+        neuron, zeros out those outside the top-k, and syncs forward weights.
+
+        Args:
+            keep: Number of connections to keep per destination
+        """
+        self._sync_reverse_weights()
+        N, S, D = self._N, self._S, self._D
+
+        for dst_slice in range(S):
+            matrices_info = []
+            for ds in range(min(D + 1, dst_slice + 1)):
+                src_slice = dst_slice - ds
+                if src_slice < 0:
+                    continue
+                if ds >= len(self._matrices_2d[src_slice]):
+                    continue
+                m = self._matrices_2d[src_slice][ds]
+                if m is not None:
+                    matrices_info.append((m, src_slice, ds))
+
+            if not matrices_info:
                 continue
 
-            # Use cached stacked_indices: (num_src, N, width)
-            all_indices = col_data['stacked_indices']
+            for dst_local in range(N):
+                weight_list = []
+                for mat_idx, (m, _, _) in enumerate(matrices_info):
+                    rev_w = m.reverse_weights[dst_local, :]
+                    mask = m.mapping.output_mask[dst_local, :]
+                    for col in range(rev_w.shape[0]):
+                        if mask[col] and rev_w[col].abs().item() > 1e-15:
+                            weight_list.append((rev_w[col].abs().item(), mat_idx, col))
 
-            # Per-slice STDP with early spike-skip (most slices are inactive)
-            with torch.no_grad():
-                for src_slice in range(num_src):
-                    if not any_active[src_slice]:
-                        continue
-                    m = matrices[src_slice]
-                    if m is None:
-                        continue
+                if len(weight_list) <= keep:
+                    continue
 
-                    fwd_weights = m.forward_weights     # (N, width)
-                    mask = m.mapping.input_mask          # (N, width)
-                    indices = all_indices[src_slice]      # (N, width)
+                weight_list.sort(reverse=True, key=lambda x: x[0])
+                to_zero = weight_list[keep:]
+                for _, mat_idx, col in to_zero:
+                    m, src_slice, ds = matrices_info[mat_idx]
+                    with torch.no_grad():
+                        m._parameters['_reverse_weights_param'][dst_local, col] = 0.0
+                        out_map = m.mapping.output_mapping[dst_local, col].item()
+                        m._parameters['_forward_weights_param'][out_map, col] = 0.0
 
-                    dst_times_exp = dst_times[src_slice][indices]   # (N, width)
-                    src_times_exp = src_times[src_slice].unsqueeze(1)  # (N, 1)
-
-                    # Distance modulation (if set)
-                    dist_factor = None
-                    if self._distance_factors is not None:
-                        dist_factor = self._distance_factors[src_slice][ds]
-
-                    new_w = _stdp_kernel(
-                        fwd_weights, mask, dst_times_exp, src_times_exp,
-                        current_time, a_pos, a_neg, tau_pos, tau_neg, eta,
-                        distance_factor=dist_factor,
-                    )
-                    m._parameters['_forward_weights_param'].copy_(new_w)
-
-            self._reverse_dirty = True
+        # Packed weights are now stale (prune modified matrix params)
+        self._weights_dirty = True
 
     def grow_connections(self, rate: float, init_weight: float = 0.01) -> int:
         """Regrow a fraction of dead (zero-weight) connections.
-        
-        Uses vectorized operations: finds all zero weights across all matrices,
-        randomly selects a fraction to regrow, and initializes with small weights.
-        
+
         Args:
             rate: Probability of regrowing each dead connection
-            init_weight: Base weight for regrown connections (actual = init_weight * U(0.5, 1.5))
-            
+            init_weight: Base weight for regrown connections
+
         Returns:
             Number of connections regrown
         """
         if rate <= 0:
             return 0
-        
+
         regrown = 0
-        
         for src_slice in range(self._S):
             for ds in range(min(self._D + 1, len(self._matrices_2d[src_slice]))):
                 m = self._matrices_2d[src_slice][ds]
                 if m is None:
                     continue
-                
-                # Find dead connections (zero and masked)
-                fwd_weights = m.forward_weights  # (N, width)
-                mask = m.mapping.input_mask  # (N, width)
-                
-                # Dead = masked AND zero weight
+
+                fwd_weights = m.forward_weights
+                mask = m.mapping.input_mask
                 dead = mask & (fwd_weights.abs() < 1e-15)
-                
+
                 if not dead.any():
                     continue
-                
-                # Random selection with probability rate
+
                 rand_mask = torch.rand_like(fwd_weights) < rate
                 to_regrow = dead & rand_mask
-                
                 n_regrow = to_regrow.sum().item()
                 if n_regrow == 0:
                     continue
-                
-                # Generate random weights for regrown connections
+
                 new_weights = init_weight * (0.5 + torch.rand_like(fwd_weights))
-                
                 with torch.no_grad():
-                    # Update forward weights
                     m._parameters['_forward_weights_param'][to_regrow] = new_weights[to_regrow]
-                    # Sync reverse weights
                     m._update_reverse_weights()
-                
+
                 regrown += n_regrow
-        
+
+        if regrown > 0:
+            self._weights_dirty = True
+
         return regrown
 
     def set_distance_factors(
@@ -633,8 +680,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
 
         Args:
             factors: 2D list matching matrices_2d layout. Each entry is
-                either a (N, width) tensor or None. Values are multiplied
-                into the STDP weight change (e.g. 1/sqrt(dist)).
+                either a (N, width) tensor or None.
         """
         self._distance_factors = factors
 
@@ -642,7 +688,6 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         """Move all matrices to device and rebuild cached column indices."""
         super().to(device)
         self._build_column_scatter_indices()
-        # Move distance factors if present
         if self._distance_factors is not None:
             for row in self._distance_factors:
                 for i, f in enumerate(row):
@@ -651,14 +696,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         return self
 
     def get_column_weights(self, ds: int) -> List[torch.Tensor]:
-        """Get weight tensors for all matrices in a ds column.
-        
-        Args:
-            ds: The ds column index
-            
-        Returns:
-            List of weight tensors, one per source slice (may be None for boundary)
-        """
+        """Get weight tensors for all matrices in a ds column."""
         weights = []
         for src_slice in range(self._S - ds):
             m = self._matrices_2d[src_slice][ds]
@@ -667,3 +705,79 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
             else:
                 weights.append(None)
         return weights
+
+    # ── CUDA graph helpers ────────────────────────────────────────────────
+
+    def warmup_cuda_graphs(
+        self,
+        spiked: torch.Tensor,
+        last_spike_time: torch.Tensor,
+        x_input: torch.Tensor,
+        current_time: int = 1,
+        a_pos: float = 1.0,
+        a_neg: float = 0.75,
+        tau_pos: float = 1.0,
+        tau_neg: float = 1.0,
+        eta: float = 0.1,
+        n_warmup: int = 3,
+    ) -> None:
+        """Run N warm-up iterations so torch.compile can trace and compile.
+
+        Call this once after construction, before the training loop, on
+        representative input tensors. Required for CUDA graph capture to work
+        correctly and for torch.compile to fully JIT-compile the hot path.
+
+        Args:
+            spiked:          (S*N,) bool tensor on target device
+            last_spike_time: (S*N,) long tensor on target device
+            x_input:         (S*N,) float tensor on target device
+            current_time:    Timestep to use for warm-up
+            n_warmup:        Number of warm-up forward+STDP iterations
+        """
+        for _ in range(n_warmup):
+            _ = self.forward(x_input)
+            self.stdp_update(
+                spiked, last_spike_time, current_time,
+                a_pos, a_neg, tau_pos, tau_neg, eta,
+            )
+        if x_input.device.type == "cuda":
+            torch.cuda.synchronize()
+
+    def capture_cuda_graph(
+        self,
+        spiked: torch.Tensor,
+        last_spike_time: torch.Tensor,
+        x_input: torch.Tensor,
+        output: torch.Tensor,
+        current_time_tensor: torch.Tensor,
+        a_pos: float = 1.0,
+        a_neg: float = 0.75,
+        tau_pos: float = 1.0,
+        tau_neg: float = 1.0,
+        eta: float = 0.1,
+    ) -> Optional['torch.cuda.CUDAGraph']:
+        """Capture the forward+STDP sequence into a CUDA graph.
+
+        CUDA graphs eliminate CPU dispatch overhead, which is the dominant
+        cost at small batch sizes (the typical case for this network).
+
+        Expects all tensors to be on CUDA. The caller must:
+        1. Call warmup_cuda_graphs() first
+        2. Keep spiked / last_spike_time / x_input as static buffers whose
+           *data* is updated in-place each timestep (not new allocations).
+        3. Replay via graph.replay() each timestep.
+
+        Returns the captured CUDAGraph or None if CUDA is not available.
+        """
+        if not torch.cuda.is_available():
+            return None
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fwd_out = self.forward(x_input)
+            output.copy_(fwd_out)
+            self.stdp_update(
+                spiked, last_spike_time, current_time_tensor.item(),
+                a_pos, a_neg, tau_pos, tau_neg, eta,
+            )
+        return graph
