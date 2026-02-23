@@ -134,6 +134,10 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         # Pre-build column-wise scatter indices
         self._build_column_scatter_indices()
 
+        # Pre-allocate intermediate buffers to avoid per-forward allocations
+        # This prevents memory leak during training sweeps
+        self._intermediate_buffers: List[Optional[torch.Tensor]] = []
+
     # ── Helpers ──────────────────────────────────────────────────────────
 
     def _sync_reverse_weights(self) -> None:
@@ -171,6 +175,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         """
         self._column_data = []
         self._packed_weights = []
+        self._intermediate_buffers = []
 
         for ds in range(self._D + 1):
             width = self._widths[ds]
@@ -179,6 +184,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
             if width == 0 or num_src == 0:
                 self._column_data.append(None)
                 self._packed_weights.append(None)
+                self._intermediate_buffers.append(None)
                 continue
 
             # Collect matrices for this column
@@ -193,6 +199,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
             if all(m is None for m in matrices):
                 self._column_data.append(None)
                 self._packed_weights.append(None)
+                self._intermediate_buffers.append(None)
                 continue
 
             # Infer device from first non-None matrix
@@ -204,6 +211,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
             if device is None:
                 self._column_data.append(None)
                 self._packed_weights.append(None)
+                self._intermediate_buffers.append(None)
                 continue
 
             # Pre-stack indices: (num_src, N, width)
@@ -228,6 +236,10 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
             # Packed weight buffer: (num_src, N, width) — filled lazily
             packed_w = torch.zeros(num_src, self._N, width, device=device)
 
+            # Pre-allocate intermediate buffer for forward pass (num_src, batch=1, N)
+            # This avoids repeated allocations during forward pass
+            intermediate_buf = torch.zeros(num_src, 1, self._N, device=device)
+
             self._column_data.append({
                 'ds': ds,
                 'width': width,
@@ -239,6 +251,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                 'device': device,
             })
             self._packed_weights.append(packed_w)
+            self._intermediate_buffers.append(intermediate_buf)
 
         # Force initial pack
         self._weights_dirty = True
@@ -358,9 +371,16 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                 # Multiply: (num_src, batch, N, width)
                 products = src_inputs.unsqueeze(-1) * stacked_weights.unsqueeze(1)
 
+                # Reuse pre-allocated intermediate buffer for batch_size=1
+                # For larger batches, allocate as needed (less common in training loop)
+                if batch_size == 1:
+                    intermediate = self._intermediate_buffers[ds]
+                    intermediate.zero_()
+                else:
+                    intermediate = torch.zeros(num_src, batch_size, self._N, device=device)
+
                 # Scatter-add to per-src intermediate: (num_src, batch, N)
                 indices_expanded = stacked_indices.unsqueeze(1).expand(-1, batch_size, -1, -1)
-                intermediate = torch.zeros(num_src, batch_size, self._N, device=device)
                 intermediate.scatter_add_(2,
                     indices_expanded.reshape(num_src, batch_size, -1),
                     products.view(num_src, batch_size, -1))
@@ -757,6 +777,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
     def to(self, device: torch.device) -> 'DirectionalRangeCompositeMapping':
         """Move all matrices to device and rebuild cached column indices."""
         super().to(device)
+        # Rebuild all cached structures including intermediate buffers
         self._build_column_scatter_indices()
         if self._distance_factors is not None:
             for row in self._distance_factors:
