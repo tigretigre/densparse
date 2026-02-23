@@ -131,12 +131,8 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         # Compute widths for each ds column
         self._widths = self._compute_widths()
 
-        # Pre-build column-wise scatter indices
+        # Pre-build column-wise scatter indices (also populates _intermediate_buffers)
         self._build_column_scatter_indices()
-
-        # Pre-allocate intermediate buffers to avoid per-forward allocations
-        # This prevents memory leak during training sweeps
-        self._intermediate_buffers: List[Optional[torch.Tensor]] = []
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
