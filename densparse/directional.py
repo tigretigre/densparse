@@ -64,7 +64,11 @@ def _stdp_kernel(
 # We warm-test with a small tensor to surface compilation failures eagerly.
 def _try_compile_stdp_kernel():
     try:
-        compiled = torch.compile(_stdp_kernel, mode="reduce-overhead")
+        # Use "default" mode rather than "reduce-overhead" so that the compiled
+        # kernel does not internally use CUDA graphs. This lets callers
+        # capture the STDP update inside an outer torch.cuda.CUDAGraph without
+        # triggering a nested-graph conflict.
+        compiled = torch.compile(_stdp_kernel, mode="default")
         # Trigger compilation now; catches broken inductor backends
         _N = 4
         w = torch.zeros(_N, 2)
@@ -832,27 +836,24 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
 
     def capture_cuda_graph(
         self,
-        spiked: torch.Tensor,
-        last_spike_time: torch.Tensor,
         x_input: torch.Tensor,
         output: torch.Tensor,
-        current_time_tensor: torch.Tensor,
-        a_pos: float = 1.0,
-        a_neg: float = 0.75,
-        tau_pos: float = 1.0,
-        tau_neg: float = 1.0,
-        eta: float = 0.1,
     ) -> Optional['torch.cuda.CUDAGraph']:
-        """Capture the forward+STDP sequence into a CUDA graph.
+        """Capture the forward pass into a CUDA graph.
 
         CUDA graphs eliminate CPU dispatch overhead, which is the dominant
         cost at small batch sizes (the typical case for this network).
 
         Expects all tensors to be on CUDA. The caller must:
-        1. Call warmup_cuda_graphs() first
-        2. Keep spiked / last_spike_time / x_input as static buffers whose
-           *data* is updated in-place each timestep (not new allocations).
+        1. Call warmup_cuda_graphs() first.
+        2. Keep x_input as a static buffer whose *data* is updated in-place
+           each timestep (not a new allocation).
         3. Replay via graph.replay() each timestep.
+
+        Note: STDP weight updates involve CPU-GPU synchronisation points
+        (spike-activity checks, Python-level branching on tensor data) that
+        are incompatible with CUDA graph capture. Call ``stdp_update``
+        separately, outside the replayed graph.
 
         Returns the captured CUDAGraph or None if CUDA is not available.
         """
@@ -863,8 +864,82 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
         with torch.cuda.graph(graph):
             fwd_out = self.forward(x_input)
             output.copy_(fwd_out)
-            self.stdp_update(
-                spiked, last_spike_time, current_time_tensor.item(),
-                a_pos, a_neg, tau_pos, tau_neg, eta,
-            )
         return graph
+
+    def _stdp_update_uncompiled(
+        self,
+        spiked: torch.Tensor,
+        last_spike_time: torch.Tensor,
+        current_time: int,
+        a_pos: float = 1.0,
+        a_neg: float = 0.75,
+        tau_pos: float = 1.0,
+        tau_neg: float = 1.0,
+        eta: float = 0.1,
+    ) -> None:
+        """GPU-path STDP update using the uncompiled kernel (for CUDA graph capture).
+
+        Identical logic to the GPU branch of ``stdp_update`` but calls
+        ``_stdp_kernel`` directly instead of ``_stdp_kernel_compiled``,
+        avoiding nested-CUDA-graph conflicts.
+        """
+        N, S, D = self._N, self._S, self._D
+        device = spiked.device
+        spiked_2d = spiked.view(S, N)
+        last_spike_2d = last_spike_time.view(S, N)
+
+        with torch.no_grad():
+            for ds in range(D + 1):
+                col_data = self._column_data[ds]
+                if col_data is None:
+                    continue
+
+                num_src = col_data['num_src']
+                width = col_data['width']
+                matrices = col_data['matrices']
+                active_mask = col_data['active_mask']
+                stacked_masks = col_data['stacked_masks']
+                all_indices = col_data['stacked_indices']
+
+                src_spiked = spiked_2d[:num_src]
+                dst_spiked = spiked_2d[ds:ds + num_src]
+                any_active = src_spiked.any(dim=1) | dst_spiked.any(dim=1)
+                if not any_active.any():
+                    continue
+
+                src_times_batch = last_spike_2d[:num_src].unsqueeze(2)
+                dst_slice_times = last_spike_2d[ds:ds + num_src]
+                dst_times_batch = torch.gather(
+                    dst_slice_times.unsqueeze(2).expand(-1, -1, width),
+                    1, all_indices,
+                )
+                slice_active = any_active.view(num_src, 1, 1)
+                effective_mask = stacked_masks & slice_active
+
+                dist_factors = None
+                if self._distance_factors is not None:
+                    dist_list = [
+                        self._distance_factors[s][ds]
+                        if (s < len(self._distance_factors) and
+                            ds < len(self._distance_factors[s]) and
+                            self._distance_factors[s][ds] is not None)
+                        else torch.zeros(N, width, device=device)
+                        for s in range(num_src)
+                    ]
+                    dist_factors = torch.stack(dist_list)
+
+                packed_w = self._packed_weights[ds]
+                new_weights = _stdp_kernel(
+                    packed_w, effective_mask,
+                    dst_times_batch, src_times_batch,
+                    current_time, a_pos, a_neg, tau_pos, tau_neg, eta,
+                    distance_factor=dist_factors,
+                )
+
+                for s, m in enumerate(matrices):
+                    if m is not None and active_mask[s]:
+                        m._parameters['_forward_weights_param'].copy_(new_weights[s])
+                packed_w.copy_(new_weights)
+
+        self._weights_dirty = False
+        self._reverse_dirty = True

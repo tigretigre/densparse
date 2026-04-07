@@ -193,17 +193,10 @@ class DenSparseMatrix(nn.Module):
 
     def to(self, device: torch.device) -> 'DenSparseMatrix':
         """Move matrix to specified device."""
-        # Move parameters and buffers
         self._parameters['_forward_weights_param'] = nn.Parameter(self._parameters['_forward_weights_param'].to(device))
         self._parameters['_reverse_weights_param'] = nn.Parameter(self._parameters['_reverse_weights_param'].to(device))
         self._buffers['_working'] = self._buffers['_working'].to(device)
-        
-        # Move mapping tensors
-        self.mapping.input_mapping = self.mapping.input_mapping.to(device)
-        self.mapping.input_mask = self.mapping.input_mask.to(device)
-        self.mapping.output_mapping = self.mapping.output_mapping.to(device)
-        self.mapping.output_mask = self.mapping.output_mask.to(device)
-        
+        self.mapping.to(device)
         return self
 
     def set_weight(self, input_idx: int, output_idx: int, weight: float, ignore_unmapped: bool = False) -> None:

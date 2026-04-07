@@ -95,11 +95,26 @@ def test_bidirectional_mapping(mapping_fixture, request):
                 assert matrix.forward_mapping[in_idx, rev_idx].item() == out_idx, f"Forward mapping mismatch for {in_idx}->{out_idx}, column {rev_idx}"
 
 
+def test_bipartite_recoloring_second_pass():
+    """Force the bipartite second-pass recoloring path with a dense mask.
+
+    A dense mask (high connectivity) causes Hopcroft-Karp to leave some edges
+    uncolored in the first pass, exercising the alternating-path recoloring.
+    """
+    torch.manual_seed(123)
+    # Dense 80% connectivity: many edges, high max-degree → needs recoloring
+    mask = torch.rand(8, 8) < 0.8
+    mapping = DenSparseMapping.from_mask(mask)
+    recovered = mapping.to_dense()
+    assert torch.equal(mask, recovered), "Recoloring must preserve all connections"
+
+
 def test_random_mask_mappings():
     """Test that from_mask and to_dense are inverses for random masks."""
     # Test different matrix sizes
     sizes = [(5, 10), (10, 5), (20, 20), (8, 15)]
 
+    torch.manual_seed(42)
     for out_size, in_size in sizes:
         # Generate random mask with ~30% connections
         mask = torch.rand(out_size, in_size) < 0.3

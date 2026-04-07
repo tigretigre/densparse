@@ -301,9 +301,23 @@ class DenSparseMapping:
         
         return cls(input_mapping, input_mask, output_mapping, output_mask)
 
+    @property
+    def device(self) -> torch.device:
+        """Device of the underlying mapping tensors."""
+        return self._input_mapping.device
+
+    def to(self, device: torch.device) -> 'DenSparseMapping':
+        """Move all mapping tensors to the given device in-place and return self."""
+        self.input_mapping = self._input_mapping.to(device)
+        self.input_mask = self._input_mask.to(device)
+        self.output_mapping = self._output_mapping.to(device)
+        self.output_mask = self._output_mask.to(device)
+        return self
+
     def to_dense(self) -> torch.Tensor:
         """Convert the mapping to a dense binary mask matrix."""
-        dense = torch.zeros(self.output_size, self.input_size, dtype=torch.bool)
+        device = self._input_mapping.device
+        dense = torch.zeros(self.output_size, self.input_size, dtype=torch.bool, device=device)
         for i in range(self.input_size):
             for k in range(self.mapping_width):
                 if self.input_mask[i, k]:
