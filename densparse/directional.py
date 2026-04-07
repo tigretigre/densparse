@@ -240,6 +240,10 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
             # This avoids repeated allocations during forward pass
             intermediate_buf = torch.zeros(num_src, 1, self._N, device=device)
 
+            # Pre-allocate STDP hot-path buffers to avoid per-timestep allocation
+            dst_times_buf = torch.zeros(num_src, self._N, width, dtype=torch.long, device=device)
+            effective_mask_buf = torch.zeros(num_src, self._N, width, dtype=torch.bool, device=device)
+
             self._column_data.append({
                 'ds': ds,
                 'width': width,
@@ -249,6 +253,9 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                 'stacked_masks': stacked_masks,
                 'active_mask': active_mask,
                 'device': device,
+                'stacked_dist_factors': None,  # filled by _rebuild_stacked_dist_factors
+                'dst_times_buffer': dst_times_buf,
+                'effective_mask_buffer': effective_mask_buf,
             })
             self._packed_weights.append(packed_w)
             self._intermediate_buffers.append(intermediate_buf)
@@ -277,6 +284,34 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                 else:
                     pw[s].zero_()
         self._weights_dirty = False
+
+    def _rebuild_stacked_dist_factors(self) -> None:
+        """Pre-stack distance factors per column so stdp_update avoids hot-path allocation.
+
+        Called by set_distance_factors() and to() after distance factors are set/moved.
+        Stores a (num_src, N, width) tensor in each col_data['stacked_dist_factors'].
+        """
+        if self._distance_factors is None:
+            for col_data in self._column_data:
+                if col_data is not None:
+                    col_data['stacked_dist_factors'] = None
+            return
+        for ds, col_data in enumerate(self._column_data):
+            if col_data is None:
+                continue
+            N = self._N
+            width = col_data['width']
+            num_src = col_data['num_src']
+            device = col_data['device']
+            dist_list = [
+                self._distance_factors[s][ds]
+                if (s < len(self._distance_factors) and
+                    ds < len(self._distance_factors[s]) and
+                    self._distance_factors[s][ds] is not None)
+                else torch.zeros(N, width, device=device)
+                for s in range(num_src)
+            ]
+            col_data['stacked_dist_factors'] = torch.stack(dist_list)
 
     # ── Forward pass ─────────────────────────────────────────────────────
 
@@ -464,33 +499,26 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
 
                     # dst_times_batch[s, i, c] = last_spike_2d[s+ds, indices[s, i, c]]
                     dst_slice_times = last_spike_2d[ds:ds + num_src]
-                    dst_times_batch = torch.gather(
+                    dst_times_buf = col_data['dst_times_buffer']
+                    torch.gather(
                         dst_slice_times.unsqueeze(2).expand(-1, -1, width),
                         1,
                         all_indices,
-                    )  # (num_src, N, width)
+                        out=dst_times_buf,
+                    )
 
-                    # Mask out inactive slices
+                    # Mask out inactive slices — write into pre-allocated buffer
                     slice_active = any_active.view(num_src, 1, 1)
-                    effective_mask = stacked_masks & slice_active
+                    effective_mask_buf = col_data['effective_mask_buffer']
+                    torch.logical_and(stacked_masks, slice_active, out=effective_mask_buf)
 
-                    # Distance modulation
-                    dist_factors = None
-                    if self._distance_factors is not None:
-                        dist_list = [
-                            self._distance_factors[s][ds]
-                            if (s < len(self._distance_factors) and
-                                ds < len(self._distance_factors[s]) and
-                                self._distance_factors[s][ds] is not None)
-                            else torch.zeros(N, width, device=device)
-                            for s in range(num_src)
-                        ]
-                        dist_factors = torch.stack(dist_list)
+                    # Distance modulation — use pre-stacked buffer (no hot-path allocation)
+                    dist_factors = col_data['stacked_dist_factors']
 
                     packed_w = self._packed_weights[ds]
                     new_weights = _stdp_kernel_compiled(
-                        packed_w, effective_mask,
-                        dst_times_batch, src_times_batch,
+                        packed_w, effective_mask_buf,
+                        dst_times_buf, src_times_batch,
                         current_time, a_pos, a_neg, tau_pos, tau_neg, eta,
                         distance_factor=dist_factors,
                     )  # (num_src, N, width)
@@ -773,6 +801,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                 either a (N, width) tensor or None.
         """
         self._distance_factors = factors
+        self._rebuild_stacked_dist_factors()
 
     def to(self, device: torch.device) -> 'DirectionalRangeCompositeMapping':
         """Move all matrices to device and rebuild cached column indices."""
@@ -784,6 +813,7 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
                 for i, f in enumerate(row):
                     if f is not None:
                         row[i] = f.to(device)
+        self._rebuild_stacked_dist_factors()
         return self
 
     def get_column_weights(self, ds: int) -> List[torch.Tensor]:
@@ -909,29 +939,22 @@ class DirectionalRangeCompositeMapping(CompositeMapping):
 
                 src_times_batch = last_spike_2d[:num_src].unsqueeze(2)
                 dst_slice_times = last_spike_2d[ds:ds + num_src]
-                dst_times_batch = torch.gather(
+                dst_times_buf = col_data['dst_times_buffer']
+                torch.gather(
                     dst_slice_times.unsqueeze(2).expand(-1, -1, width),
                     1, all_indices,
+                    out=dst_times_buf,
                 )
                 slice_active = any_active.view(num_src, 1, 1)
-                effective_mask = stacked_masks & slice_active
+                effective_mask_buf = col_data['effective_mask_buffer']
+                torch.logical_and(stacked_masks, slice_active, out=effective_mask_buf)
 
-                dist_factors = None
-                if self._distance_factors is not None:
-                    dist_list = [
-                        self._distance_factors[s][ds]
-                        if (s < len(self._distance_factors) and
-                            ds < len(self._distance_factors[s]) and
-                            self._distance_factors[s][ds] is not None)
-                        else torch.zeros(N, width, device=device)
-                        for s in range(num_src)
-                    ]
-                    dist_factors = torch.stack(dist_list)
+                dist_factors = col_data['stacked_dist_factors']
 
                 packed_w = self._packed_weights[ds]
                 new_weights = _stdp_kernel(
-                    packed_w, effective_mask,
-                    dst_times_batch, src_times_batch,
+                    packed_w, effective_mask_buf,
+                    dst_times_buf, src_times_batch,
                     current_time, a_pos, a_neg, tau_pos, tau_neg, eta,
                     distance_factor=dist_factors,
                 )
