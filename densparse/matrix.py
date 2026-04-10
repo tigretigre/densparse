@@ -8,11 +8,19 @@ INPUT_BATCH_SLICE = 0
 OUTPUT_BATCH_SLICE = 1
 
 class DenSparseMatrix(nn.Module):
-    def __init__(self, mapping: DenSparseMapping, max_batch: int = 32):
+    def __init__(
+        self,
+        mapping: DenSparseMapping,
+        max_batch: int = 32,
+        device: torch.device = torch.device("cpu"),
+    ):
         """
         Args:
             mapping: DenSparseMapping object containing the mapping matrices
             max_batch: Maximum batch size for matrix multiplication
+            device: Device on which to allocate weight parameters and working
+                buffer. Defaults to CPU; pass a CUDA device to avoid the
+                host-to-device copy that would otherwise occur on first use.
         """
         super().__init__()
         self.mapping = mapping
@@ -21,19 +29,24 @@ class DenSparseMatrix(nn.Module):
         # Initialize the forward and reverse weight matrices as parameters
         self.register_parameter(
             '_forward_weights_param',
-            nn.Parameter(torch.zeros(mapping.input_size, mapping.mapping_width))
+            nn.Parameter(torch.zeros(mapping.input_size, mapping.mapping_width, device=device))
         )
         self.register_parameter(
             '_reverse_weights_param',
-            nn.Parameter(torch.zeros(mapping.output_size, mapping.mapping_width))
+            nn.Parameter(torch.zeros(mapping.output_size, mapping.mapping_width, device=device))
         )
 
         # Create working area tensor as a buffer
         max_size = max(mapping.input_size, mapping.output_size)
         self.register_buffer(
             '_working',
-            torch.zeros(max_size, mapping.mapping_width, 2 * max(1, max_batch))
+            torch.zeros(max_size, mapping.mapping_width, 2 * max(1, max_batch), device=device)
         )
+
+        # Move mapping tensors to the target device so that scatter operations
+        # inside forward() and _update_reverse_weights() see consistent devices.
+        if device.type != "cpu":
+            mapping.to(device)
 
     @property
     def input_size(self) -> int:
