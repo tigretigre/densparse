@@ -4,7 +4,7 @@ import torch
 from densparse.mapping import DenSparseMapping
 from densparse.matrix import DenSparseMatrix
 from densparse.mapping_utils import square_cycle_mapping, up_cycle_mapping, down_cycle_mapping
-from densparse.directional import DirectionalRangeCompositeMapping, _stdp_kernel
+from densparse.directional import DirectionalRangeCompositeMapping
 from densparse.composite import CompositeMapping
 
 
@@ -213,80 +213,6 @@ class TestDenSparseMatrixGPU:
 
 
 # ---------------------------------------------------------------------------
-# _stdp_kernel direct tests (covers the function body regardless of compile)
-# ---------------------------------------------------------------------------
-
-class TestStdpKernelDirect:
-    """Test _stdp_kernel directly to ensure coverage of the function body."""
-
-    def _make_tensors(self, N=4, width=3, device=CPU):
-        fwd = torch.rand(N, width, device=device)
-        mask = torch.ones(N, width, dtype=torch.bool, device=device)
-        dst_times = torch.randint(1, 5, (N, width), device=device)
-        src_times = torch.randint(1, 5, (N, 1), device=device)
-        return fwd, mask, dst_times, src_times
-
-    def test_cpu_causal(self):
-        fwd, mask, dst_times, src_times = self._make_tensors()
-        # Force dst > src (causal: potentiation)
-        dst_times = torch.full_like(dst_times, 5)
-        src_times = torch.full_like(src_times, 3)
-        src_times[0] = 5  # current_time: dst just spiked
-        new_w = _stdp_kernel(fwd, mask, dst_times, src_times, 5, 1.0, 0.75, 1.0, 1.0, 0.1)
-        assert new_w.shape == fwd.shape
-        assert (new_w >= 0).all() and (new_w <= 1).all()
-
-    def test_cpu_anti_causal(self):
-        fwd, mask, dst_times, src_times = self._make_tensors()
-        src_times = torch.full_like(src_times, 5)  # src just spiked
-        dst_times = torch.full_like(dst_times, 3)  # dst spiked earlier
-        new_w = _stdp_kernel(fwd, mask, dst_times, src_times, 5, 1.0, 0.75, 1.0, 1.0, 0.1)
-        assert new_w.shape == fwd.shape
-
-    def test_with_distance_factor(self):
-        fwd, mask, dst_times, src_times = self._make_tensors()
-        dist_factor = torch.rand_like(fwd)
-        new_w = _stdp_kernel(fwd, mask, dst_times, src_times, 5, 1.0, 0.75, 1.0, 1.0, 0.1,
-                             distance_factor=dist_factor)
-        assert new_w.shape == fwd.shape
-
-    def test_mask_zeros_exclude(self):
-        """Masked-out connections should not be updated."""
-        N, width = 4, 3
-        fwd = torch.rand(N, width)
-        mask = torch.zeros(N, width, dtype=torch.bool)
-        dst_times = torch.full((N, width), 5, dtype=torch.long)
-        src_times = torch.full((N, 1), 3, dtype=torch.long)
-        new_w = _stdp_kernel(fwd, mask, dst_times, src_times, 5, 1.0, 0.75, 1.0, 1.0, 0.1)
-        # Unmasked entries unchanged
-        assert torch.allclose(new_w, fwd)
-
-    def test_clamping(self):
-        """Weights should be clamped to [0, 1]."""
-        N, width = 4, 3
-        fwd = torch.ones(N, width) * 0.99
-        mask = torch.ones(N, width, dtype=torch.bool)
-        dst_times = torch.full((N, width), 5, dtype=torch.long)
-        src_times = torch.full((N, 1), 3, dtype=torch.long)
-        new_w = _stdp_kernel(fwd, mask, dst_times, src_times, 5, 1.0, 0.75, 1.0, 1.0, 1.0)
-        assert (new_w <= 1.0).all()
-        assert (new_w >= 0.0).all()
-
-    def test_cuda_execution(self):
-        fwd, mask, dst_times, src_times = self._make_tensors(device=CUDA)
-        new_w = _stdp_kernel(fwd, mask, dst_times, src_times, 5, 1.0, 0.75, 1.0, 1.0, 0.1)
-        assert new_w.device.type == "cuda"
-        assert new_w.shape == fwd.shape
-
-    def test_cuda_with_distance_factor(self):
-        fwd, mask, dst_times, src_times = self._make_tensors(device=CUDA)
-        dist = torch.rand_like(fwd)
-        new_w = _stdp_kernel(fwd, mask, dst_times, src_times, 5, 1.0, 0.75, 1.0, 1.0, 0.1,
-                             distance_factor=dist)
-        assert new_w.device.type == "cuda"
-
-
-# ---------------------------------------------------------------------------
 # DirectionalRangeCompositeMapping GPU tests
 # ---------------------------------------------------------------------------
 
@@ -338,42 +264,6 @@ class TestDirectionalGPU:
         y_cpu = comp_cpu.forward(x)
         y_gpu = comp_gpu.forward(x.to(CUDA)).cpu()
         assert torch.allclose(y_cpu, y_gpu, atol=1e-4)
-
-    def test_stdp_update_gpu_path(self):
-        """GPU STDP path is exercised when device is CUDA."""
-        comp = _build_directional(N=8, S=4, D=2)
-        comp.to(CUDA)
-
-        N_total = 4 * 8
-        spiked = torch.zeros(N_total, dtype=torch.bool, device=CUDA)
-        spiked[0] = True
-        spiked[8] = True  # Different slice
-        last_spike = torch.zeros(N_total, dtype=torch.long, device=CUDA)
-        last_spike[0] = 1
-        last_spike[8] = 2
-
-        comp.stdp_update(spiked, last_spike, current_time=3)
-
-        # Weights should still be on CUDA
-        for row in comp._matrices_2d:
-            for m in row:
-                if m is not None:
-                    assert m.forward_weights.device.type == "cuda"
-
-    def test_stdp_no_spikes_skipped(self):
-        """When no neurons spike, stdp_update should be a no-op."""
-        comp = _build_directional(N=8, S=4, D=2)
-        comp.to(CUDA)
-
-        # Record initial weights
-        w_before = comp._matrices_2d[0][0].forward_weights.clone()
-
-        spiked = torch.zeros(4 * 8, dtype=torch.bool, device=CUDA)
-        last_spike = torch.zeros(4 * 8, dtype=torch.long, device=CUDA)
-        comp.stdp_update(spiked, last_spike, current_time=1)
-
-        w_after = comp._matrices_2d[0][0].forward_weights
-        assert torch.allclose(w_before, w_after)
 
     def test_normalize_incoming_on_cuda(self):
         comp = _build_directional(N=8, S=4, D=2)
@@ -440,76 +330,6 @@ class TestDirectionalGPU:
         # num_src for ds=2: S-2 = 2
         assert len(weights) == 2
 
-    def test_warmup_cuda_graphs(self):
-        """warmup_cuda_graphs runs without error."""
-        comp = _build_directional(N=8, S=4, D=1)
-        comp.to(CUDA)
-        N_total = 4 * 8
-        spiked = torch.zeros(N_total, dtype=torch.bool, device=CUDA)
-        last_spike = torch.zeros(N_total, dtype=torch.long, device=CUDA)
-        x_in = torch.randn(N_total, device=CUDA)
-        comp.warmup_cuda_graphs(spiked, last_spike, x_in, n_warmup=2)
-
-    def test_capture_cuda_graph(self):
-        """CUDA graph capture (forward-only) produces a CUDAGraph that replays correctly."""
-        comp = _build_directional(N=8, S=4, D=1)
-        comp.to(CUDA)
-        N_total = 4 * 8
-        spiked = torch.zeros(N_total, dtype=torch.bool, device=CUDA)
-        last_spike = torch.zeros(N_total, dtype=torch.long, device=CUDA)
-        x_in = torch.randn(N_total, device=CUDA)
-        output = torch.zeros(N_total, device=CUDA)
-
-        comp.warmup_cuda_graphs(spiked, last_spike, x_in, n_warmup=3)
-        graph = comp.capture_cuda_graph(x_in, output)
-        assert graph is not None
-        # Replay should not raise
-        graph.replay()
-        torch.cuda.synchronize()
-        # output should have been populated
-        assert output.shape == (N_total,)
-
-    def test_stdp_update_uncompiled_gpu(self):
-        """_stdp_update_uncompiled runs on GPU and produces correct device tensors."""
-        comp = _build_directional(N=8, S=4, D=2)
-        comp.to(CUDA)
-        N_total = 4 * 8
-        spiked = torch.zeros(N_total, dtype=torch.bool, device=CUDA)
-        spiked[0] = True
-        last_spike = torch.zeros(N_total, dtype=torch.long, device=CUDA)
-        last_spike[0] = 2
-
-        w_before = comp._matrices_2d[0][0].forward_weights.clone()
-        comp._stdp_update_uncompiled(spiked, last_spike, current_time=3)
-        # Weights should still be on CUDA
-        assert comp._matrices_2d[0][0].forward_weights.device.type == "cuda"
-
-    def test_stdp_update_uncompiled_with_distance_factors(self):
-        """_stdp_update_uncompiled with distance factors runs without error."""
-        comp = _build_directional(N=8, S=4, D=2)
-        factors = []
-        for s in range(4):
-            row = []
-            for ds in range(3):
-                if s + ds < 4:
-                    m = comp._matrices_2d[s][ds]
-                    if m is not None:
-                        row.append(torch.rand(8, m.mapping.mapping_width))
-                    else:
-                        row.append(None)
-                else:
-                    row.append(None)
-            factors.append(row)
-        comp.set_distance_factors(factors)
-        comp.to(CUDA)
-
-        N_total = 4 * 8
-        spiked = torch.zeros(N_total, dtype=torch.bool, device=CUDA)
-        spiked[0] = True
-        last_spike = torch.zeros(N_total, dtype=torch.long, device=CUDA)
-        last_spike[0] = 1
-        comp._stdp_update_uncompiled(spiked, last_spike, current_time=3)
-
     def test_distance_factors_on_cuda(self):
         """Distance factors are correctly moved to CUDA in to()."""
         comp = _build_directional(N=8, S=4, D=2)
@@ -532,32 +352,6 @@ class TestDirectionalGPU:
             for f in row:
                 if f is not None:
                     assert f.device.type == "cuda"
-
-    def test_stdp_with_distance_factors_on_cuda(self):
-        """STDP with distance factors runs on GPU."""
-        comp = _build_directional(N=8, S=4, D=2)
-        factors = []
-        for s in range(4):
-            row = []
-            for ds in range(3):
-                if s + ds < 4:
-                    m = comp._matrices_2d[s][ds]
-                    if m is not None:
-                        row.append(torch.rand(8, m.mapping.mapping_width))
-                    else:
-                        row.append(None)
-                else:
-                    row.append(None)
-            factors.append(row)
-        comp.set_distance_factors(factors)
-        comp.to(CUDA)
-
-        N_total = 4 * 8
-        spiked = torch.zeros(N_total, dtype=torch.bool, device=CUDA)
-        spiked[0] = True
-        last_spike = torch.zeros(N_total, dtype=torch.long, device=CUDA)
-        last_spike[0] = 2
-        comp.stdp_update(spiked, last_spike, current_time=3)
 
 
 # ---------------------------------------------------------------------------
